@@ -1,0 +1,24 @@
+version = 1
+
+[agent]
+domain = "llm-serving"
+
+[accuracy]
+command = [
+  "uv", "run", "--no-project",
+  "--with-requirements", ".vibesys/tasks/llama-70b-2xh100-vllm/requirements.txt",
+  "python", ".vibesys/tasks/llama-70b-2xh100-vllm/accuracy_checker/checker.py",
+]
+timeout_seconds = 300
+
+[benchmark]
+command = [
+  "uv", "run", "--no-project",
+  "--with-requirements", ".vibesys/tasks/llama-70b-2xh100-vllm/requirements.txt",
+  "python", ".vibesys/tasks/llama-70b-2xh100-vllm/benchmark/benchmark.py",
+]
+timeout_seconds = 600
+
+[benchmark.result]
+json_argument = "--output-json"
+metric = "aggregate_throughput"

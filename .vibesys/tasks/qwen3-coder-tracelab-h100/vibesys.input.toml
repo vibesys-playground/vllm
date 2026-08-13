@@ -3,6 +3,9 @@ version = 1
 [agent]
 domain = "llm-serving"
 
+[environment.modal]
+entrypoint = "examples/deployment/vibesys_qwen3_coder_tracelab.py"
+
 [accuracy]
 command = [
   "uv", "run", "--no-project", "--with-requirements",

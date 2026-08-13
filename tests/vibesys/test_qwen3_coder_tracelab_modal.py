@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import tomllib
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = (
     REPOSITORY_ROOT / "examples" / "deployment" / "vibesys_qwen3_coder_tracelab.py"
@@ -14,6 +16,21 @@ MODULE_SPEC = importlib.util.spec_from_file_location(
 assert MODULE_SPEC is not None and MODULE_SPEC.loader is not None
 main = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(main)
+
+
+def test_task_declares_modal_deployment_entrypoint():
+    manifest_path = (
+        REPOSITORY_ROOT
+        / ".vibesys"
+        / "tasks"
+        / "qwen3-coder-tracelab-h100"
+        / "vibesys.input.toml"
+    )
+    manifest = tomllib.loads(manifest_path.read_text())
+
+    entrypoint = manifest["environment"]["modal"]["entrypoint"]
+    assert entrypoint == "examples/deployment/vibesys_qwen3_coder_tracelab.py"
+    assert (REPOSITORY_ROOT / entrypoint).is_file()
 
 
 def test_prompt_token_details_are_enabled():

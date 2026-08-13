@@ -11,6 +11,7 @@ Available tasks:
 - `llama-3-8b-h100-high-concurrency`
 - `llama-3-8b-h100-long-prompts`
 - `llama-70b-2xh100-vllm`
+- `qwen3-coder-tracelab-h100`
 
 Select a task explicitly when this repository contains more than one:
 

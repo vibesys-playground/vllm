@@ -1,0 +1,24 @@
+version = 1
+
+[agent]
+domain = "llm-serving"
+
+[accuracy]
+command = [
+  "uv", "run", "--no-project",
+  "--with-requirements", ".vibesys/tasks/qwen3.5-397b-a17b-4xb200-vllm/requirements.txt",
+  "python", ".vibesys/tasks/qwen3.5-397b-a17b-4xb200-vllm/accuracy_checker/checker.py",
+]
+timeout_seconds = 600
+
+[benchmark]
+command = [
+  "uv", "run", "--no-project",
+  "--with-requirements", ".vibesys/tasks/qwen3.5-397b-a17b-4xb200-vllm/requirements.txt",
+  "python", ".vibesys/tasks/qwen3.5-397b-a17b-4xb200-vllm/benchmark/benchmark.py",
+]
+timeout_seconds = 1200
+
+[benchmark.result]
+json_argument = "--output-json"
+metric = "aggregate_throughput"

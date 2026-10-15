@@ -96,8 +96,15 @@ And over the logprobs:
 
 - the reference's token must be in the candidate's top 10;
 - the candidate's logprob of it within **1.0 nat** of the range the reference's
-  repeats spanned on every answer, and within **0.25 nats** on average (the
-  distance is 0 inside the range).
+  repeats spanned (the distance is 0 inside the range). An answer whose token
+  matches but whose logprob is further out is a **logprob-only miss**: at most
+  **20%** of answers may be (cached-path answers are not repeatable even on one
+  build), and a token mismatch is still a hard failure;
+- the mean distance over all answers within **0.25 nats**, so logprobs shifted
+  across the board fail even with every token right.
+
+The report gives `logprob_only_misses`, `logprob_only_miss_names`, and the
+limits (`max_logprob_miss_share`, `mean_abs_dlogprob_limit`).
 
 The replay-shaped request's token must be the logprob request's, a token the
 reference gave, or a near tie of the reference's top token. It carries no

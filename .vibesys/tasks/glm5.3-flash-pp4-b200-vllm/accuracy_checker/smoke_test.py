@@ -15,7 +15,8 @@
      one prompt in three) fails against the first build's reference alone, and
      passes once make_reference.py --merge adds its answers; the first build still
      passes the merged reference; a constant-token server, a shuffled-answer server
-     and large noise all fail it.
+     and large noise all fail it; logprobs scaled across the board (tokens intact)
+     fail on the mean |dlogprob|.
 
 usage: smoke_test.py --text-file <enwik9>
 """
@@ -125,6 +126,12 @@ def main() -> int:
         if name == "alt-numerics":
             report = json.loads(result.stdout[result.stdout.rindex("\n{\n"):result.stdout.rindex("}") + 1])
             assert report["answers_by_build"]["b"] > 0, report["answers_by_build"]
+    # Logprobs flattened or sharpened across the board with every token unchanged: the mean limit fails it.
+    for scale in ("0.3", "2.0"):
+        result = with_server(["--logprob-scale", scale], on_merged)
+        print(f"--- logprob-scale {scale} against builds a+b: exit {result.returncode}")
+        assert result.returncode == 1 and "mean |dlogprob|" in result.stdout, result.stdout[-2000:]
+        assert '"mismatches": 0' in result.stdout, result.stdout[-2000:]
     print("ALL CHECKER SMOKE CASES PASSED")
     return 0
 

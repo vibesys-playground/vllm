@@ -141,6 +141,88 @@ def test_validation_names_a_slot_missing_a_build() -> None:
         raise AssertionError("accepted a format-2 reference")
 
 
+def verdict_set(n: int, *, wrong: int = 0, misses: int = 0, shift: float = 0.0) -> list[checker.Verdict]:
+    """n distinct-token answers judged against single-build records: the first `wrong` answer a token
+    outside the reference, the next `misses` have a matching token but a logprob 2 nats off its range,
+    and every answer's logprob is moved by `shift` nats."""
+    rng = random.Random(7)
+    out = []
+    for i in range(n):
+        record = random_record(rng)
+        record["lp_range"] = [record["top"][0][1]] * 2
+        top = {int(t): lp for t, lp in record["top"]}
+        token = record["token"]
+        if i < wrong:
+            token = 999_000 + i
+            top[token] = 1.0
+        elif i < wrong + misses:
+            top[record["token"]] -= 2.0
+        top[record["token"]] += -shift if i >= wrong + misses else 0.0
+        answer = Answer(token=token, top=top, prompt_tokens=8, cached_tokens=0, seconds=0.1)
+        out.append(checker.judge_builds(f"a{i}", {"b": record}, answer, 8))
+    return out
+
+
+def summary_of(verdicts: list[checker.Verdict]) -> tuple[bool, dict]:
+    return checker.summarize(verdicts, [], {"builds": [{"id": "b"}]})
+
+
+def test_one_logprob_only_miss_in_37_passes_and_is_reported() -> None:
+    ok, summary = summary_of(verdict_set(37, misses=1))
+    assert ok, summary["failures"]
+    assert summary["logprob_only_misses"] == 1 and summary["mismatches"] == 0
+    assert summary["logprob_only_miss_names"] == ["a0"]
+    assert summary["max_logprob_miss_share"] == checker.MAX_LOGPROB_MISS_SHARE == 0.2
+    assert summary["mean_abs_dlogprob_limit"] == checker.MEAN_ABS_DLOGPROB == 0.25
+
+
+def test_a_wrong_token_still_fails() -> None:
+    ok, summary = summary_of(verdict_set(37, wrong=1))
+    assert not ok and summary["mismatches"] == 1
+    assert any("mismatch" in f for f in summary["failures"])
+
+
+def test_logprob_only_misses_above_the_share_fail() -> None:
+    n = 40
+    limit = int(checker.MAX_LOGPROB_MISS_SHARE * n)
+    ok, summary = summary_of(verdict_set(n, misses=limit + 1))
+    assert not ok and any("logprob-only misses" in f for f in summary["failures"])
+    ok, summary = summary_of(verdict_set(n, misses=limit))
+    assert not any("logprob-only misses" in f for f in summary["failures"])
+
+
+def test_systematically_shifted_logprobs_fail_on_the_mean_with_matching_tokens() -> None:
+    ok, summary = summary_of(verdict_set(37, shift=0.5))
+    # 0.5 nats is inside the 1.0 per-answer tolerance: no misses, every token matches.
+    assert summary["logprob_only_misses"] == 0 and summary["mismatches"] == 0
+    assert not ok and any("mean |dlogprob|" in f for f in summary["failures"])
+    ok, summary = summary_of(verdict_set(37, shift=0.1))
+    assert ok, summary["failures"]
+
+
+def test_a_constant_token_server_fails() -> None:
+    rng = random.Random(8)
+    verdicts = []
+    for i in range(37):
+        record = random_record(rng)
+        top = {int(t): lp for t, lp in record["top"]}
+        answer = Answer(token=4242, top={**top, 4242: -0.1}, prompt_tokens=8, cached_tokens=0, seconds=0.1)
+        verdicts.append(checker.judge_builds(f"c{i}", {"b": record}, answer, 8))
+    ok, summary = summary_of(verdicts)
+    assert not ok and summary["mismatches"] == 37
+
+
+def test_a_token_outside_every_build_is_never_a_logprob_only_miss() -> None:
+    rng = random.Random(9)
+    for _ in range(CASES):
+        records = {f"b{i}": random_record(rng) for i in range(rng.randint(1, 3))}
+        answer = random_answer(rng, list(records.values()))
+        best = checker.judge_builds("c", records, answer, 8)
+        accepted = {int(t) for r in records.values() for t in r["tokens"]}
+        if best.logprob_miss:
+            assert best.kind == "match" and best.got in accepted
+
+
 def main() -> int:
     tests = [(name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)]
     for name, fn in tests:

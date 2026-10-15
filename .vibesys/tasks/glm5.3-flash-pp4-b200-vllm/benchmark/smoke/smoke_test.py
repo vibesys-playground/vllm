@@ -15,6 +15,10 @@ Runs the real session_runner on a tiny synthetic trace (16 sessions, a
   slow-screen every request takes 9 s, over the 8 s bound: rejected at screening
   big-block   prefix-cache blocks of 1,536 tokens: rejected at screening, before
               session_runner's 1,024-token preflight would abort
+  record      recording mode on a healthy server: writes the replay reference the
+              scored cases below are checked against
+  faked-replay streamed (replay-shaped) requests get a wrong token: rejected by the
+              replay-reference agreement check
   judge       a finished run with p99 7 s: scored, slo_met 0; with p99 9 s: rejected
               by the end-of-run gate (the 8 s smoke bound)
 
@@ -76,10 +80,13 @@ def smoke_workload(trace_sha: str) -> sr.Workload:
         # The real bound is 60 s; 8 s keeps the abort and screening cases short
         # while staying above the 6.5 s slow requests of the `slo` case.
         reject_p99_ttft_s=SMOKE_REJECT_S,
+        # 16 sessions: their round 0s alone match; 40 needs some later rounds too.
+        replay_min_agreement=0.95, replay_min_matched_rounds=40,
     )
 
 
-def run_case(name: str, server_flags: list[str], ns: argparse.Namespace, root: Path, sha: str) -> list[dict]:
+def run_case(name: str, server_flags: list[str], ns: argparse.Namespace, root: Path, sha: str,
+             mode: list[str] | None = None) -> list[dict]:
     port = free_port()
     server = subprocess.Popen([sys.executable, str(FAKE), "--port", str(port), *server_flags],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -94,6 +101,7 @@ def run_case(name: str, server_flags: list[str], ns: argparse.Namespace, root: P
             "--asset-dir", str(root),
             "--tokenizer", ns.tokenizer,
             "--vs-output", str(out),
+            *(mode if mode is not None else ["--replay-reference", str(root / "replay_reference.json")]),
         ])
         started = time.time()
         code = sr.run(args, smoke_workload(sha), sr.ProtocolReport(out))
@@ -123,21 +131,31 @@ def case_judge() -> None:
     metrics = {"rounds": 90, "rounds_per_s": 4.5, "new_tokens_per_s": 4000.0, "prompt_tokens_per_s": 1.0,
                "computed_tokens_per_s": 1.0, "prefix_hit_share": 0.9,
                "ttft_s": {"p50": 0.1, "p90": 0.2, "p99": 7.0, "max": 9.0}, "rounds_ttft_over_60s": 0}
-    values = sr.judge(metrics, watch, facts, workload, screened)
+    agree = sr.Agreement(matched=100, agreed=99, first_disagreement=None)
+    values = sr.judge(metrics, watch, facts, workload, screened, agree)
     assert set(values) == set(sr.METRICS), set(sr.METRICS) ^ set(values)
     assert values["slo_met"] == 0.0 and abs(values["slo_margin_s"] + 1.0) < 1e-9, values
     metrics["ttft_s"]["p99"] = 5.0
-    values = sr.judge(metrics, watch, facts, workload, screened)
+    values = sr.judge(metrics, watch, facts, workload, screened, agree)
     assert values["slo_met"] == 1.0 and abs(values["slo_margin_s"] - 1.0) < 1e-9, values
     metrics["ttft_s"]["p99"] = 9.0
     try:
-        sr.judge(metrics, watch, facts, workload, screened)
+        sr.judge(metrics, watch, facts, workload, screened, agree)
     except sr.Rejected as exc:
         assert "p99 TTFT 9.00 s is over the 8 s rejection bound" in str(exc), exc
         assert exc.partial["name"] == "p99_ttft_s" and exc.partial["target"] == 6.0
         print(f"--- judge: rejected as expected: {exc}")
     else:
         raise AssertionError("judge accepted a p99 over the rejection bound")
+    metrics["ttft_s"]["p99"] = 5.0
+    for bad, needle in ((sr.Agreement(100, 94, "x"), "disagree with the reference build"),
+                        (sr.Agreement(39, 39, None), "fewer than 40")):
+        try:
+            sr.judge(metrics, watch, facts, workload, screened, bad)
+        except sr.Rejected as exc:
+            assert needle in str(exc), exc
+        else:
+            raise AssertionError(f"judge accepted {bad}")
     # The early-abort count is a property of the quantile and the ceiling, not of the bound.
     assert sr.rounds_over_bound_that_fail(41_444) == 416
     assert sr.WORKLOAD.reject_p99_ttft_s == 60.0
@@ -152,13 +170,22 @@ def main() -> int:
     parser.add_argument("--text-file", required=True)
     parser.add_argument("--case", action="append", default=None)
     ns = parser.parse_args()
-    cases = ns.case or ["judge", "pass", "slo", "abort", "failure", "shortfall", "no-cache", "slow-screen", "big-block"]
+    cases = ns.case or ["judge", "record", "faked-replay", "pass", "slo", "abort", "failure", "shortfall", "no-cache", "slow-screen", "big-block"]
     root = Path(tempfile.mkdtemp(prefix="session_replay_smoke-"))
     sha = make_trace(root / "smoke.csv")
     print(f"smoke root {root}")
     for name in cases:
         if name == "judge":
             case_judge()
+        elif name == "record":
+            ref = root / "replay_reference.json"
+            records = run_case(name, [], ns, root, sha, ["--record-replay-reference", str(ref)])
+            assert [r["kind"] for r in records] == ["hello", "result"], records
+            rounds = json.loads(ref.read_text())["rounds"]
+            assert len(rounds) >= 100, len(rounds)
+            print(f"--- record: {len(rounds)} rounds in the replay reference")
+        elif name == "faked-replay":
+            expect_error(run_case(name, ["--fake-replay"], ns, root, sha), "disagree with the reference build")
         elif name == "pass":
             records = run_case(name, [], ns, root, sha)
             assert [r["kind"] for r in records] == ["hello", "result"], records
@@ -167,6 +194,7 @@ def main() -> int:
             assert values["new_tokens_per_s"] > 0 and values["p99_ttft_s"] < 6
             assert values["slo_met"] == 1.0 and values["slo_margin_s"] > 0, values
             assert values["prefix_hit_share"] > 0.5, values
+            assert values["replay_token_agreement"] == 1.0 and values["replay_matched_rounds"] >= 40, values
         elif name == "slo":
             records = run_case(name, ["--slow-every", "5", "--slow-ms", "6500"], ns, root, sha)
             assert [r["kind"] for r in records] == ["hello", "result"], records

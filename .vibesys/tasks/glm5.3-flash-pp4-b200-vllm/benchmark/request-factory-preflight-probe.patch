@@ -1,3 +1,129 @@
+diff --git a/src/backend/client.rs b/src/backend/client.rs
+index d59956d..fdc823a 100644
+--- a/src/backend/client.rs
++++ b/src/backend/client.rs
+@@ -15,7 +15,10 @@ use base64::Engine as _;
+ use std::path::PathBuf;
+ 
+ use crate::cli::Args;
+-use crate::record::{GenerationOutcome, ServerUsageLog};
++use crate::record::{prompt_fnv1a64, GenerationOutcome, ServerUsageLog};
++use std::collections::hash_map::RandomState;
++use std::hash::BuildHasher;
++use std::sync::OnceLock;
+ use crate::util::{elapsed_ms, ratio, unix_seconds_now};
+ 
+ use super::integrity::{classify_prompt_echo, PromptEcho};
+@@ -87,9 +90,13 @@ impl GenerationClient {
+         // Submit raw token ids: no client-side decode, so even million-token prompts cost nothing
+         // here and the server's prefix-cache keys match the exact ids we built.
+         let capturing_routes = self.routed_experts_dir.is_some();
++        // The id on the wire is an opaque per-process keyed hash of the logged
++        // id, so a server cannot tell a replay round from any other request by
++        // its id (the log keeps the readable id).
++        let wire_id = opaque_wire_id(&request_id);
+         let payload = self.backend.build_payload(&GenRequest {
+             model: &self.model,
+-            request_id: &request_id,
++            request_id: &wire_id,
+             prompt,
+             max_tokens,
+             temperature: self.temperature,
+@@ -107,10 +114,10 @@ impl GenerationClient {
+ 
+         let mut fold = StreamAccumulator::new(max_tokens, self.record_timeline);
+         if let Some(directory) = &self.routed_experts_dir {
+-            self.fold_body(&request_id, &payload, send_instant, &mut fold, directory)
++            self.fold_body(&wire_id, &payload, send_instant, &mut fold, directory)
+                 .await;
+         } else {
+-            self.fold_response(&request_id, &payload, send_instant, &mut fold)
++            self.fold_response(&wire_id, &payload, send_instant, &mut fold)
+                 .await;
+         }
+ 
+@@ -177,6 +184,8 @@ impl GenerationClient {
+                 }
+             }
+         }
++        // After the echo trim: the first id the server generated, not a prompt echo.
++        let first_output_token_id = output_token_ids.first().copied();
+         let output_len_actual = server.completion_tokens.unwrap_or({
+             if output_token_ids.is_empty() {
+                 output_len_text_tokens
+@@ -246,6 +255,8 @@ impl GenerationClient {
+                 status,
+                 output_preview: output_text.chars().take(100).collect(),
+                 error,
++                first_output_token_id,
++                prompt_fnv1a64: Some(prompt_fnv1a64(prompt_ids)),
+             },
+             output_ids,
+             timeline,
+@@ -393,3 +404,11 @@ impl GenerationClient {
+         }
+     }
+ }
++
++/// 32 hex digits from two randomly keyed SipHash instances, keyed once per
++/// process: stable for one id within a run, unpredictable across runs.
++fn opaque_wire_id(request_id: &str) -> String {
++    static KEYS: OnceLock<(RandomState, RandomState)> = OnceLock::new();
++    let (a, b) = KEYS.get_or_init(|| (RandomState::new(), RandomState::new()));
++    format!("{:016x}{:016x}", a.hash_one(request_id), b.hash_one(request_id))
++}
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 0285651..cc478fb 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -133,6 +133,8 @@ pub(crate) fn context_limit_skip_result(
+             complete_timestamp: unix_seconds_now(),
+             first_token_ms: None,
+             first_token_id_ms: None,
++            first_output_token_id: None,
++            prompt_fnv1a64: None,
+             last_token_id_ms: None,
+             first_token_event_tokens: 0,
+             token_event_count: 0,
+diff --git a/src/record.rs b/src/record.rs
+index 3985443..2a5e108 100644
+--- a/src/record.rs
++++ b/src/record.rs
+@@ -164,6 +164,25 @@ pub(crate) struct GenerationOutcome {
+     pub(crate) status: String,
+     pub(crate) output_preview: String,
+     pub(crate) error: Option<String>,
++    /// The server's first generated token id, as streamed (`return_token_ids`);
++    /// `None` when the server returned no ids. Lets a replay be checked against
++    /// a reference run's answers.
++    pub(crate) first_output_token_id: Option<u32>,
++    /// FNV-1a 64 of the exact prompt ids sent (each id as 4 little-endian
++    /// bytes), 16 hex digits; `None` for a request that never reached the wire.
++    pub(crate) prompt_fnv1a64: Option<String>,
++}
++
++/// Stable digest of a prompt's token ids: FNV-1a 64 over little-endian u32s.
++pub(crate) fn prompt_fnv1a64(ids: &[u32]) -> String {
++    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
++    for id in ids {
++        for byte in id.to_le_bytes() {
++            hash ^= u64::from(byte);
++            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++        }
++    }
++    format!("{hash:016x}")
+ }
+ 
+ #[derive(Debug, Serialize)]
+@@ -294,6 +313,8 @@ mod tests {
+             complete_timestamp: 1.2,
+             first_token_ms: Some(10.0),
+             first_token_id_ms: Some(10.0),
++            first_output_token_id: None,
++            prompt_fnv1a64: None,
+             last_token_id_ms: Some(19.0),
+             first_token_event_tokens: 1,
+             token_event_count: 4,
 diff --git a/src/runner.rs b/src/runner.rs
 index 8ceeac8..e8f75ca 100644
 --- a/src/runner.rs
@@ -11,3 +137,16 @@ index 8ceeac8..e8f75ca 100644
          let probe_len = token_pool.len().min(PREFLIGHT_PROBE_TOKENS);
          client
              .preflight_cache_check(&token_pool[token_pool.len() - probe_len..])
+diff --git a/src/summary.rs b/src/summary.rs
+index d33ca0e..dcd0971 100644
+--- a/src/summary.rs
++++ b/src/summary.rs
+@@ -577,6 +577,8 @@ mod tests {
+             complete_timestamp,
+             first_token_ms,
+             first_token_id_ms: first_token_ms,
++            first_output_token_id: None,
++            prompt_fnv1a64: None,
+             last_token_id_ms: None,
+             first_token_event_tokens: 0,
+             token_event_count: 0,

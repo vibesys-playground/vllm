@@ -17,7 +17,8 @@ cached tokens the way vLLM does.
 Fault flags make the failure paths testable: --slow-every/--slow-ms (TTFT
 outliers), --fail-after (HTTP 500), --drop-token-ids-after (no generated ids:
 the client's next prompt comes up short), --canned (one fixed token for every
-prompt), --noise (perturbed logits), --no-cache-report.
+prompt), --noise (perturbed logits), --no-cache-report, --fake-replay (streamed
+requests, the replay's shape, get a wrong token; non-streamed ones the right one).
 """
 from __future__ import annotations
 
@@ -135,6 +136,9 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(delay_s)
         logits = self.model.logits(prompt)
         token = max(logits, key=logits.get)
+        if args.fake_replay and body.get("stream"):
+            # A gaming server: skip the work on the shape the replay sends.
+            token = 4242
         usage = {"prompt_tokens": len(prompt), "completion_tokens": 1, "total_tokens": len(prompt) + 1}
         if not args.no_cache_report:
             usage["prompt_tokens_details"] = {"cached_tokens": cached}
@@ -188,6 +192,7 @@ def main() -> None:
     parser.add_argument("--canned", action="store_true")
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--no-cache-report", action="store_true")
+    parser.add_argument("--fake-replay", action="store_true")
     args = parser.parse_args()
     Handler.model = Model(args)
     server = Server(("127.0.0.1", args.port), Handler)

@@ -19,6 +19,10 @@ Per answer (the first generated token and its top-10 logprobs):
             MAX_ABS_DLOGPROB of the reference's, and the mean over answers within
             MEAN_ABS_DLOGPROB. The reference token missing from the candidate's
             top 10 is a mismatch.
+Every prompt is also sent first as a request shaped exactly like a benchmark
+replay round (streamed, no logprobs, opaque id); its token must equal the
+logprob request's, so a server cannot serve the benchmark's request shape a
+cheaper, different answer (README.md, "Threat model").
 Also: the server must count every prompt token, return the generated token id,
 report a prefix-cache hit for each cached round 1 of at least 32k tokens of
 prefix, and its answers must vary with the prompt like the reference's do.
@@ -32,7 +36,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import MODEL, REFERENCE_VERSION, Answer, RequestError, complete, get_json, unpack_ids  # noqa: E402
+from common import (  # noqa: E402
+    MODEL, REFERENCE_VERSION, Answer, RequestError, complete, get_json, replay_shaped_token, unpack_ids,
+)
 
 REFERENCE = Path(__file__).with_name("reference.json")
 
@@ -46,7 +52,8 @@ MEAN_ABS_DLOGPROB = 0.25
 # Below this prefix a cache hit is not required: a hybrid model's prefix cache
 # may only resume at block boundaries of several thousand tokens.
 MIN_PREFIX_FOR_REQUIRED_HIT = 32 * 1024
-REQUEST_TIMEOUT_S = 600.0
+# A cold 128k prompt on a slow or broken-but-honest candidate; 600 s was tight.
+REQUEST_TIMEOUT_S = 1200.0
 
 
 @dataclasses.dataclass
@@ -96,7 +103,16 @@ def run(base_url: str, model: str, reference: dict, log=print) -> tuple[bool, di
     hit_problems: list[str] = []
 
     def check(name: str, expect: dict, prompt: list[int]) -> Verdict:
+        # The replay-shaped request goes first, so it sees the cache state the case
+        # sets up (cold, or round 0 cached); the logprob request then repeats it.
+        shaped, shaped_prompt_tokens, shaped_cached = replay_shaped_token(base, model, prompt, REQUEST_TIMEOUT_S)
         verdict = judge(name, expect, complete(base, model, prompt, REQUEST_TIMEOUT_S), len(prompt))
+        verdict.cached_tokens = shaped_cached
+        if shaped != verdict.got:
+            verdict.problems.append(f"the replay-shaped request answered {shaped}, the logprob request {verdict.got}")
+        if shaped_prompt_tokens != len(prompt):
+            verdict.problems.append(f"replay-shaped request: usage.prompt_tokens {shaped_prompt_tokens} for a "
+                                    f"{len(prompt)}-token prompt")
         verdicts.append(verdict)
         flag = "" if verdict.kind == "match" and not verdict.problems else f"  <-- {verdict.kind} {verdict.problems}"
         log(f"{name}: expected {verdict.expected} got {verdict.got} "

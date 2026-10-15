@@ -11,13 +11,18 @@ operator's copy must equal.
 ```bash
 python session_replay.py \
   --base-url http://127.0.0.1:PORT/v1 \
-  --request-factory-engine <session_runner built at request-factory 7f6aa9d8e36f3b81ae1f6c76c69f460f95f9c84c> \
+  --request-factory-engine <session_runner: request-factory 7f6aa9d8e36f3b81ae1f6c76c69f460f95f9c84c + request-factory-preflight-probe.patch> \
   --text-file <enwik9> \
   --asset-dir <dir with sessions_2ps.csv and sessions_2ps.manifest.json> \
   [--model nvidia/GLM-5.3-Flash-NVFP4] [--tokenizer <tokenizer.json>] [--work-dir DIR] \
   --preflight-probe-tokens 32768 \
+  --replay-reference <operator path>/replay_reference.json \
   --vs-output <path>        # appended by VibeSys
 ```
+
+Recording the replay reference (once, on the reference build, TP4+EP):
+the same flags with `--record-replay-reference <operator path>/replay_reference.json`
+instead of `--replay-reference` ("Replay answers" below).
 
 - The server must already be running. The script never starts one.
 - `--tokenizer` defaults to `tokenizer.json` of the pinned revision in the
@@ -80,6 +85,33 @@ Reported metrics: `p99_ttft_s` (primary objective) and `new_tokens_per_s`
 zero (first-come-first-served slots, tool waits, 500 slots) admits 41,444
 rounds and 120.3k new tokens/s inside the window. No server exceeds it, since a
 positive TTFT only delays every later event. The design's 118.8k is 98.8% of it.
+
+## Replay answers
+
+Nothing in latency or throughput shows whether the server computed the replay's
+answers, so a scored run checks them (NOTES.md D15 has the threat model).
+The patched session_runner logs, per round, `prompt_fnv1a64` (FNV-1a 64 of the
+exact prompt ids it sent, each as 4 little-endian bytes) and
+`first_output_token_id` (the server's first streamed generated id), and sends
+an opaque per-process keyed hash as its request id instead of
+`session_X_round_Y`.
+
+- `--record-replay-reference OUT` (reference build only): the normal run, then
+  writes `{session_id}/{round_idx} -> [prompt hash, first token]` for every
+  successful round. Rejected, writing nothing, on a failed request, a prefix
+  shortfall, or any other correctness gate; the p99 gates do not stop it (no
+  early abort).
+- `--replay-reference PATH` (every scored run; an operator path, never in the
+  candidate tree): a round is *matched* when the reference has the same
+  session round with the same prompt hash. Rejected when under 95% of matched
+  rounds give the reference's first token, or under 1,000 rounds match.
+  Reported: `replay_token_agreement`, `replay_matched_rounds`.
+
+A flipped token changes every later prompt of its session, so later rounds
+are unmatched rather than wrong. Round 0 of every session depends only on the
+corpus, so it is always matched, and so is a session's first wrong answer after
+any run of right ones: a server that answers the replay wrongly agrees on
+almost nothing.
 
 ## Screening
 

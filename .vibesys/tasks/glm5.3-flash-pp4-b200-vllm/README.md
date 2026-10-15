@@ -41,7 +41,12 @@ The checkpoint must be in the Hugging Face cache at revision
 --text-file <enwik9, md5 e206c3450ac99950df65bf70ef61a12d>
 --asset-dir <dir with sessions_2ps.csv (sha256 a1a1e78b...eb3e72) and sessions_2ps.manifest.json>
 --preflight-probe-tokens 32768
+--replay-reference <operator path>/replay_reference.json
 ```
+
+`--replay-reference` is the reference build's replay answers, recorded once
+with `--record-replay-reference` on the TP4+EP reference server
+(`benchmark/README.md`, "Replay answers"). Keep it outside the candidate tree.
 
 and, when the tokenizer is not in the default Hugging Face cache,
 `--tokenizer <tokenizer.json>` or `HF_HUB_CACHE`/`HF_HOME` in the environment.

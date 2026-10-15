@@ -91,7 +91,12 @@ METRICS: dict[str, dict[str, Any]] = {
     "fraction_of_workload_ceiling": {"unit": "fraction", "direction": "max"},
     "screen_ttft_16k_s": {"unit": "s", "direction": "min"},
     "screen_ttft_32k_s": {"unit": "s", "direction": "min"},
+    "replay_token_agreement": {"unit": "fraction of prompt-matched rounds whose first token equals the reference's",
+                               "direction": "max"},
+    "replay_matched_rounds": {"unit": "rounds"},
 }
+
+REPLAY_REFERENCE_FORMAT = "glm53-session-replay-reference-v1"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,6 +133,11 @@ class Workload:
     # p99 TTFT over this rejects the run; the early abort fires once it is certain,
     # and screening rejects a lone 16k prompt slower than this.
     reject_p99_ttft_s: float
+    # The replay-reference check (README.md, "Replay answers"): over rounds whose
+    # exact prompt matches the reference run's, at least this share of first
+    # tokens must equal the reference's, and at least this many rounds must match.
+    replay_min_agreement: float = 0.95
+    replay_min_matched_rounds: int = 1_000
 
 
 WORKLOAD = Workload(
@@ -147,6 +157,15 @@ WORKLOAD = Workload(
     stall_timeout_s=600.0,
     request_timeout_s=180.0,
     reject_p99_ttft_s=REJECT_P99_TTFT_S,
+    replay_min_agreement=0.95,
+    # Every admitted session's round 0 is built from the corpus alone, so its
+    # prompt matches the reference's whatever the server answered before; each
+    # later round matches until the session's first first-token flip. The
+    # zero-latency replay admits 1,679 sessions in the window and counts 41,444
+    # rounds, so an honest run matches tens of thousands; 1,000 still makes the
+    # 5% tolerance about 50 rounds, and a server that answers the replay wrongly
+    # matches little more than its round 0s.
+    replay_min_matched_rounds=1_000,
 )
 
 
@@ -493,6 +512,11 @@ class LogWatch:
     first_failure: str | None = None
     first_shortfall: str | None = None
     new_tokens: int = 0
+    # "<session_id>/<round_idx>" -> (prompt hash, first output token id) of each
+    # successful round, for the replay-reference check and for recording one.
+    answers: dict[str, tuple[str, int]] = dataclasses.field(default_factory=dict)
+    # Successful rounds the patched session_runner should have hashed but did not.
+    unhashed_rounds: int = 0
     _buffer: str = ""
     _offset: int = 0
 
@@ -527,6 +551,12 @@ class LogWatch:
         else:
             self.successes += 1
             self.new_tokens += int(source.get("input_len") or 0)
+            prompt_hash = outcome.get("prompt_fnv1a64")
+            first_id = outcome.get("first_output_token_id")
+            if prompt_hash is None:
+                self.unhashed_rounds += 1
+            elif first_id is not None:
+                self.answers[f"{source.get('session_id')}/{source.get('round_idx')}"] = (prompt_hash, int(first_id))
             ttft_ms = outcome.get("first_token_id_ms")
             if ttft_ms is not None and outcome.get("post_timestamp") is not None:
                 first_token = outcome["post_timestamp"] + ttft_ms / 1e3
@@ -542,6 +572,11 @@ class LogWatch:
 
     def verdict(self) -> str | None:
         """Why the run has already failed, or None while it can still pass."""
+        if self.unhashed_rounds:
+            return (
+                f"{self.unhashed_rounds} round(s) logged without `prompt_fnv1a64`: --request-factory-engine "
+                "must be built with benchmark/request-factory-preflight-probe.patch"
+            )
         if self.failures:
             return f"a request failed ({self.failures} so far); first: {self.first_failure}"
         if self.shortfall_rounds:
@@ -557,6 +592,90 @@ class LogWatch:
                 f"rounds put the p99 TTFT over the {self.ttft_bound_s:.0f} s rejection bound"
             )
         return None
+
+
+# ----------------------------------------------------------------------------- replay reference
+
+
+def write_replay_reference(path: Path, watch: LogWatch, workload: Workload, model: str) -> None:
+    """The reference run's answers: prompt hash and first token per session round."""
+    body = {
+        "format": REPLAY_REFERENCE_FORMAT,
+        "model": model,
+        "trace_sha256": workload.trace_sha256,
+        "recorded_at_unix_s": time.time(),
+        "rounds": {key: [h, token] for key, (h, token) in sorted(watch.answers.items())},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(body) + "\n")
+    tmp.replace(path)
+    log(f"replay reference: {len(watch.answers)} rounds written to {path}")
+
+
+def load_replay_reference(path: Path, workload: Workload, model: str) -> dict[str, tuple[str, int]]:
+    if not path.is_file():
+        raise Rejected(f"--replay-reference {path} does not exist (record it with --record-replay-reference "
+                       "against the reference build; README.md, Replay answers)")
+    try:
+        body = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise Rejected(f"--replay-reference {path}: not JSON: {exc}") from exc
+    if body.get("format") != REPLAY_REFERENCE_FORMAT:
+        raise Rejected(f"--replay-reference {path}: format {body.get('format')!r}, expected {REPLAY_REFERENCE_FORMAT!r}")
+    if body.get("trace_sha256") != workload.trace_sha256:
+        raise Rejected(f"--replay-reference {path} was recorded on trace {body.get('trace_sha256')}, "
+                       f"this workload is {workload.trace_sha256}")
+    if body.get("model") != model:
+        raise Rejected(f"--replay-reference {path} was recorded for model {body.get('model')!r}, not {model!r}")
+    return {key: (str(h), int(token)) for key, (h, token) in body["rounds"].items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Agreement:
+    matched: int
+    agreed: int
+    first_disagreement: str | None
+
+    @property
+    def share(self) -> float:
+        return self.agreed / self.matched if self.matched else 0.0
+
+
+def replay_agreement(answers: dict[str, tuple[str, int]], reference: dict[str, tuple[str, int]]) -> Agreement:
+    """First-token agreement over rounds whose exact prompt the reference run also sent.
+
+    One differing token changes every later prompt of that session, so those
+    rounds have no reference answer and are left out rather than counted wrong.
+    """
+    matched = agreed = 0
+    first: str | None = None
+    for key, (prompt_hash, token) in answers.items():
+        expected = reference.get(key)
+        if expected is None or expected[0] != prompt_hash:
+            continue
+        matched += 1
+        if token == expected[1]:
+            agreed += 1
+        elif first is None:
+            first = f"{key}: token {token}, reference {expected[1]}"
+    return Agreement(matched, agreed, first)
+
+
+def check_agreement(agreement: Agreement, workload: Workload) -> None:
+    detail = (f"{agreement.agreed} of {agreement.matched} prompt-matched rounds gave the reference's first token "
+              f"({agreement.share:.1%}); first disagreement: {agreement.first_disagreement}")
+    partial = {"name": "replay_token_agreement", "value": agreement.share, "direction": "max",
+               "unit": "fraction", "target": workload.replay_min_agreement}
+    if agreement.share < workload.replay_min_agreement:
+        raise Rejected(
+            f"run rejected: replay answers disagree with the reference build: {detail}; at least "
+            f"{workload.replay_min_agreement:.0%} must agree (README.md, Replay answers)", partial)
+    if agreement.matched < workload.replay_min_matched_rounds:
+        raise Rejected(
+            f"run rejected: only {agreement.matched} rounds sent the same prompt as the reference run, fewer "
+            f"than {workload.replay_min_matched_rounds}: the replay answers cannot be checked. {detail}", partial)
+    log(f"replay reference: {detail}")
 
 
 def session_runner_argv(
@@ -617,12 +736,16 @@ def progress_partial(watch: LogWatch, facts: TraceFacts, elapsed_s: float) -> di
 
 
 def replay(argv: list[str], work_dir: Path, workload: Workload, facts: TraceFacts,
-           poll_s: float = 2.0) -> LogWatch:
-    """Run session_runner for the window and return the folded request log."""
+           poll_s: float = 2.0, early_abort: bool = True) -> LogWatch:
+    """Run session_runner for the window and return the folded request log.
+
+    `early_abort=False` (recording a reference) keeps running past a certain p99
+    rejection; correctness failures still stop the run.
+    """
     log_path = work_dir / "requests.jsonl"
     err_path = work_dir / "session_runner.stderr"
-    watch = LogWatch(over_bound_limit=rounds_over_bound_that_fail(facts.ceiling_rounds), window_s=workload.window_s,
-                     ttft_bound_s=workload.reject_p99_ttft_s)
+    limit = rounds_over_bound_that_fail(facts.ceiling_rounds) if early_abort else sys.maxsize
+    watch = LogWatch(over_bound_limit=limit, window_s=workload.window_s, ttft_bound_s=workload.reject_p99_ttft_s)
     log(f"replay: {' '.join(argv)}")
     started = time.time()
     last_record = started
@@ -687,7 +810,7 @@ def score(log_path: Path, workload: Workload) -> dict[str, Any]:
 
 
 def judge(metrics: dict[str, Any], watch: LogWatch, facts: TraceFacts, workload: Workload,
-          screened: dict[str, float]) -> dict[str, float]:
+          screened: dict[str, float], agreement: Agreement) -> dict[str, float]:
     """The run's result row, or `Rejected` when a gate fails.
 
     Gates: no failed request, `prefix_shortfall_tokens` 0 on every round, at
@@ -700,6 +823,7 @@ def judge(metrics: dict[str, Any], watch: LogWatch, facts: TraceFacts, workload:
         raise Rejected(f"run rejected: {why}", progress_partial(watch, facts, workload.window_s))
     if metrics["rounds"] == 0:
         raise Rejected("no round was counted in the window")
+    check_agreement(agreement, workload)
     p99 = metrics["ttft_s"]["p99"]
     bound = workload.reject_p99_ttft_s
     if p99 > bound:
@@ -726,6 +850,8 @@ def judge(metrics: dict[str, Any], watch: LogWatch, facts: TraceFacts, workload:
         "fraction_of_sim_target": metrics["new_tokens_per_s"] / SIM_TARGET_NEW_TOKENS_PER_S,
         "fraction_of_workload_ceiling": metrics["new_tokens_per_s"]
         / max(facts.ceiling_new_tokens / workload.window_s, 1.0),
+        "replay_token_agreement": agreement.share,
+        "replay_matched_rounds": float(agreement.matched),
         **screened,
     }
 
@@ -760,17 +886,35 @@ def run(args: argparse.Namespace, workload: Workload, report: ProtocolReport) ->
         if args.model not in models:
             raise Rejected(f"the server serves {models}, not --model {args.model!r}")
 
+        recording = args.record_replay_reference is not None
+        if recording == (args.replay_reference is not None):
+            raise Rejected("pass exactly one of --replay-reference PATH (a scored run) and "
+                           "--record-replay-reference OUT (recording on the reference build)")
+        reference = None if recording else load_replay_reference(Path(args.replay_reference), workload, args.model)
+
         screened = screen(args.base_url, args.model, workload)
 
         argv = session_runner_argv(
             engine, trace, Path(args.text_file), tokenizer, args.base_url, args.model, workload, work_dir
         )
-        watch = replay(argv, work_dir, workload, facts)
+        watch = replay(argv, work_dir, workload, facts, early_abort=not recording)
+        if recording:
+            # Correctness gates only: a reference must not record broken rounds,
+            # but a slow reference build still records valid answers.
+            why = watch.verdict()
+            if why is not None:
+                raise Rejected(f"recording rejected, nothing written: {why}")
+            write_replay_reference(Path(args.record_replay_reference), watch, workload, args.model)
+            agreement = Agreement(len(watch.answers), len(watch.answers), None)
+            workload = dataclasses.replace(workload, replay_min_matched_rounds=0)
+        else:
+            assert reference is not None
+            agreement = replay_agreement(watch.answers, reference)
         metrics = score(work_dir / "requests.jsonl", workload)
         (work_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         log(f"metrics.py: {json.dumps(metrics)}")
 
-        values = judge(metrics, watch, facts, workload, screened)
+        values = judge(metrics, watch, facts, workload, screened, agreement)
         report.emit(values)
         print(json.dumps(values, indent=2))
         return 0
@@ -796,6 +940,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preflight-probe-tokens", type=int, default=None,
                         help="probe length of the session_runner build: 8192 at rev 7f6aa9d (default), "
                              "32768 with benchmark/request-factory-preflight-probe.patch")
+    parser.add_argument("--replay-reference", default=None,
+                        help="operator path of the reference build's replay answers (made with "
+                             "--record-replay-reference); required for a scored run")
+    parser.add_argument("--record-replay-reference", default=None, metavar="OUT",
+                        help="recording mode, on the reference build only: run the replay and write its "
+                             "per-round prompt hashes and first tokens to OUT")
     parser.add_argument("--vs-output", type=Path, default=None, help="result protocol v2 stream (VibeSys)")
     return parser.parse_args(argv)
 

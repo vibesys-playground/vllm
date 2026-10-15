@@ -6,7 +6,8 @@
   3. passes it with small logit noise (0.02 nats),
   4. fails it with large logit noise (1.5 nats),
   5. fails a server that answers one canned token for every prompt,
-  6. fails a server that does not report cached tokens (no prefix-cache hit).
+  6. fails a server that does not report cached tokens (no prefix-cache hit),
+  7. fails a server that answers replay-shaped (streamed) requests differently.
 
 usage: smoke_test.py --text-file <enwik9>
 """
@@ -56,7 +57,8 @@ def main() -> int:
     print(f"reference: {reference.stat().st_size} bytes")
     checker = [sys.executable, str(HERE / "checker.py"), "--base-url", "{URL}", "--reference", str(reference)]
     cases = [("clean", [], 0), ("small-noise", ["--noise", "0.02"], 0), ("large-noise", ["--noise", "1.5"], 1),
-             ("canned", ["--canned"], 1), ("no-cache-report", ["--no-cache-report"], 1)]
+             ("canned", ["--canned"], 1), ("no-cache-report", ["--no-cache-report"], 1),
+             ("fake-replay", ["--fake-replay"], 1)]
     for name, flags, expected in cases:
         result = with_server(flags, checker)
         verdict = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
@@ -67,6 +69,8 @@ def main() -> int:
             failures = result.stdout[result.stdout.find('"failures"'):][:300]
             print(f"    {failures}")
         assert result.returncode == expected, (name, result.stdout[-2000:], result.stderr[-2000:])
+        if name == "fake-replay":
+            assert "the replay-shaped request answered 4242" in result.stdout, result.stdout[-2000:]
     print("ALL CHECKER SMOKE CASES PASSED")
     return 0
 

@@ -1,0 +1,20 @@
+# Primary: p99 TTFT over the 20-minute window (reference/1_contract.md §3).
+# The goal is p99 <= 6 s (the contract's SLO), reported as `slo_met` and
+# `slo_margin_s`; the SLO is not a gate, so every working candidate is scored.
+# benchmark/session_replay.py rejects a run only when p99 exceeds 60 s.
+[[objective]]
+name = "p99_ttft_s"
+direction = "min"
+
+# Second axis: new prompt tokens/s. Closed-loop replay caps it at 120.3k
+# (zero-latency ceiling); the handoff design reaches 98.8% of that.
+[[objective]]
+name = "new_tokens_per_s"
+direction = "max"
+
+[pareto]
+# Run-to-run spread of a 20-minute closed-loop replay on a fresh server. A
+# tail percentile moves more between runs than throughput does; the handoff saw
+# a contended host read 16% low (reference/1_contract.md §5). Revisit after two
+# baseline runs on GPUs.
+relative_noise = 0.02

@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+"""20-minute coding-agent session replay for GLM-5.3-Flash NVFP4 prefill on 4 x B200.
+
+The benchmark of `reference/1_contract.md` §2.2 at N = 500: the trace
+`sessions_2ps.csv` (2,457 sessions arriving at 2/s, at most 500 active),
+replayed closed-loop with request-factory's `session_runner` (rev 7f6aa9d),
+token-ID prompts built from enwik9, temperature 0, one output token per round.
+Scored with the handoff's `metrics.py` (copied verbatim next to this file).
+
+Phases:
+  1. Inputs. Verify the trace's sha256 and its manifest, enwik9's md5, the
+     tokenizer revision, and that the server serves `--model`.
+  2. Screening (seconds on a healthy server). A lone fresh 16k prompt twice,
+     a session-shaped follow-up that must hit the prefix cache, and a lone 32k
+     prompt. Rejects a server that cannot return token ids, miscounts the
+     prompt, does not report cached tokens, or whose best lone 16k TTFT is over
+     60 s, the rejection bound (README.md "Screening" says why that proves the
+     run would be rejected).
+  3. Replay. session_runner under a 20-minute window measured from the first
+     request's submit (t = 0 of §3), plus a grace for in-flight responses.
+     The request log is read while it grows; the run stops early when failure
+     is already certain (README.md "Early abort").
+  4. Score. `metrics.py` on the request log, then the gates: no failed
+     request, `prefix_shortfall_tokens` 0 on every round, p99 TTFT <= 60 s.
+     The 6 s SLO is not a gate: `slo_met` (1/0) and `slo_margin_s` (6 s minus
+     p99) report it, and p99 TTFT is the primary objective.
+
+Result: an evaluator result protocol v2 stream written to `--vs-output`
+(VibeSys appends the flag): `hello`, then one `result` row, or one `error`
+record (a rejected run) carrying what was measured before the stop.
+
+The workload is fixed by this file's `WORKLOAD` and is not configurable from
+the command line; tests construct their own `Workload` through `run()`.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import dataclasses
+import hashlib
+import heapq
+import http.client
+import json
+import os
+import random
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+HERE = Path(__file__).resolve().parent
+METRICS_PY = HERE / "metrics.py"
+PINNED_MANIFEST = HERE / "sessions_2ps.manifest.json"
+
+MODEL = "nvidia/GLM-5.3-Flash-NVFP4"
+MODEL_REVISION = "da920bb0b9f4a06727223a349e55468e38352348"
+ENWIK9_MD5 = "e206c3450ac99950df65bf70ef61a12d"
+ENWIK9_BYTES = 1_000_000_000
+TRACE_FORMAT = "text-generation-session-execution-v2"
+MAX_MODEL_LEN = 1_048_576
+
+# The contract's SLO. Reported (`slo_met`, `slo_margin_s`), not a gate.
+SLO_P99_TTFT_S = 6.0
+# A run whose p99 TTFT is over this is rejected (an `error`): hopeless, and the
+# early abort saves its GPU time. WORKLOAD.reject_p99_ttft_s carries it.
+REJECT_P99_TTFT_S = 60.0
+# The handoff design's simulated result at N = 500 (reference/README.md, "Final: sessions").
+SIM_TARGET_NEW_TOKENS_PER_S = 118_800.0
+SIM_TARGET_P99_TTFT_S = 4.94
+
+PROTOCOL_VERSION = 2
+METRICS: dict[str, dict[str, Any]] = {
+    "new_tokens_per_s": {"unit": "new prompt tokens/s", "direction": "max"},
+    "p99_ttft_s": {"unit": "s", "direction": "min"},
+    "slo_met": {"unit": "1 if p99 TTFT <= 6 s, else 0", "direction": "max"},
+    "slo_margin_s": {"unit": "s (6 s minus p99 TTFT; negative = SLO missed)", "direction": "max"},
+    "p50_ttft_s": {"unit": "s", "direction": "min"},
+    "p90_ttft_s": {"unit": "s", "direction": "min"},
+    "max_ttft_s": {"unit": "s", "direction": "min"},
+    "rounds_per_s": {"unit": "rounds/s", "direction": "max"},
+    "computed_tokens_per_s": {"unit": "prompt tokens computed/s"},
+    "prefix_hit_share": {"unit": "fraction", "direction": "max"},
+    "rounds_ttft_over_60s": {"unit": "rounds", "direction": "min"},
+    "fraction_of_sim_target": {"unit": "fraction", "direction": "max"},
+    "fraction_of_workload_ceiling": {"unit": "fraction", "direction": "max"},
+    "screen_ttft_16k_s": {"unit": "s", "direction": "min"},
+    "screen_ttft_32k_s": {"unit": "s", "direction": "min"},
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class Workload:
+    """Everything that defines the measured workload."""
+
+    trace_name: str
+    trace_sha256: str
+    # The pinned manifest the asset dir's copy must equal; None skips the check.
+    manifest: Path | None
+    # enwik9's size and md5; None skips the check (tests use a small corpus).
+    text_bytes: int | None
+    text_md5: str | None
+    max_concurrency: int
+    window_s: float
+    # Time after the window for responses already in flight to be logged. Rounds
+    # whose first token arrives after the window are not counted by metrics.py.
+    grace_s: float
+    # Screening prompt lengths, in tokens.
+    screen_gate_tokens: int
+    screen_info_tokens: int
+    screen_append_tokens: int
+    # session_runner's prefix-cache preflight sends one probe of this many tokens
+    # twice and aborts unless the second reports cached tokens (runner.rs,
+    # PREFLIGHT_PROBE_TOKENS: 8,192 at rev 7f6aa9d).
+    preflight_probe_tokens: int
+    # session_runner must log its first round within this time of starting
+    # (corpus tokenization and the prefix-cache preflight come first).
+    startup_timeout_s: float
+    # A run with rounds outstanding and nothing logged for this long has stalled.
+    # session_runner's own per-request stream idle timeout is 600 s.
+    stall_timeout_s: float
+    request_timeout_s: float
+    # p99 TTFT over this rejects the run; the early abort fires once it is certain,
+    # and screening rejects a lone 16k prompt slower than this.
+    reject_p99_ttft_s: float
+
+
+WORKLOAD = Workload(
+    trace_name="sessions_2ps.csv",
+    trace_sha256="a1a1e78b231b7e5bbe02b7e6db7a83cd85d2e9de98262b89a70263c274eb3e72",
+    manifest=PINNED_MANIFEST,
+    text_bytes=ENWIK9_BYTES,
+    text_md5=ENWIK9_MD5,
+    max_concurrency=500,
+    window_s=1200.0,
+    grace_s=15.0,
+    screen_gate_tokens=16_384,
+    screen_info_tokens=32_768,
+    screen_append_tokens=1_024,
+    preflight_probe_tokens=8_192,
+    startup_timeout_s=900.0,
+    stall_timeout_s=600.0,
+    request_timeout_s=180.0,
+    reject_p99_ttft_s=REJECT_P99_TTFT_S,
+)
+
+
+class Rejected(Exception):
+    """The run is rejected: an `error` record with an optional partial measurement."""
+
+    def __init__(self, message: str, partial: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.partial = partial
+
+
+# ----------------------------------------------------------------------------- output
+
+
+class ProtocolReport:
+    """The record stream at `--vs-output`; `hello` is written before measuring."""
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._write({"kind": "hello", "protocol": PROTOCOL_VERSION, "metrics": METRICS}, mode="w")
+
+    def emit(self, values: dict[str, float]) -> None:
+        missing = sorted(set(METRICS) - set(values))
+        if missing:
+            raise ValueError(f"result row lacks declared metrics {missing}")
+        self._write({"kind": "result", "label": "", "values": {k: values[k] for k in METRICS}})
+
+    def fail(self, message: str, partial: dict[str, Any] | None) -> None:
+        record: dict[str, Any] = {"kind": "error", "message": message or "benchmark failed"}
+        if partial is not None:
+            record["partial"] = partial
+        self._write(record)
+
+    def _write(self, record: dict[str, Any], mode: str = "a") -> None:
+        if self._path is None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open(mode, encoding="utf-8") as handle:
+            handle.write(json.dumps(record, allow_nan=False) + "\n")
+
+
+def log(message: str) -> None:
+    print(f"[session_replay {time.strftime('%H:%M:%S')}] {message}", file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------------------- inputs
+
+
+def file_digest(path: Path, algorithm: str) -> str:
+    digest = hashlib.new(algorithm)
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 24), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def verify_trace(asset_dir: Path, workload: Workload) -> Path:
+    trace = asset_dir / workload.trace_name
+    if not trace.is_file():
+        raise Rejected(f"--asset-dir {asset_dir} has no {workload.trace_name}")
+    actual = file_digest(trace, "sha256")
+    if actual != workload.trace_sha256:
+        raise Rejected(f"{trace}: sha256 {actual}, expected {workload.trace_sha256}")
+    manifest = workload.manifest
+    if manifest is not None:
+        shipped = asset_dir / manifest.name
+        if not shipped.is_file():
+            raise Rejected(f"--asset-dir {asset_dir} has no {manifest.name}")
+        if json.loads(shipped.read_text()) != json.loads(manifest.read_text()):
+            raise Rejected(f"{shipped} differs from the pinned {manifest}")
+    return trace
+
+
+def verify_text(path: Path, workload: Workload) -> None:
+    if not path.is_file():
+        raise Rejected(f"--text-file {path} does not exist")
+    size = path.stat().st_size
+    if workload.text_bytes is not None and size != workload.text_bytes:
+        raise Rejected(f"--text-file {path}: {size} bytes, enwik9 has {workload.text_bytes}")
+    if workload.text_md5 is not None:
+        actual = file_digest(path, "md5")
+        if actual != workload.text_md5:
+            raise Rejected(f"--text-file {path}: md5 {actual}, enwik9 is {workload.text_md5}")
+
+
+def resolve_tokenizer(explicit: Path | None) -> Path:
+    """tokenizer.json of the pinned checkpoint revision in the Hugging Face cache."""
+    if explicit is not None:
+        if not explicit.is_file():
+            raise Rejected(f"--tokenizer {explicit} is not a file")
+        return explicit
+    hub = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if hub is None:
+        hf_home = os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+        hub = str(Path(hf_home) / "hub")
+    snapshot = Path(hub) / f"models--{MODEL.replace('/', '--')}" / "snapshots" / MODEL_REVISION
+    candidate = snapshot / "tokenizer.json"
+    if not candidate.is_file():
+        raise Rejected(
+            f"tokenizer.json of {MODEL}@{MODEL_REVISION} not found at {candidate}; "
+            "pass --tokenizer or set HF_HOME / HF_HUB_CACHE"
+        )
+    return candidate
+
+
+@dataclasses.dataclass(frozen=True)
+class TraceFacts:
+    rounds: int
+    sessions: int
+    ceiling_rounds: int
+    ceiling_new_tokens: int
+
+
+def trace_facts(trace: Path, workload: Workload) -> TraceFacts:
+    """The trace's size and its zero-latency ceiling.
+
+    The ceiling replays the trace's closed loop with every TTFT at zero: a
+    session takes a slot at its arrival or when one frees (first come, first
+    served), each round follows the previous one after its tool wait, and the
+    slot frees after the last round's wait. Rounds submitted inside the window
+    are the most any server can have counted: a positive TTFT only delays every
+    later event. It bounds the counted rounds for the early-abort rule, and its
+    new tokens are the throughput no candidate can exceed.
+    """
+    sessions: dict[str, list[tuple[int, float, float, int]]] = {}
+    rounds = 0
+    with trace.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            rounds += 1
+            sessions.setdefault(row["session_id"], []).append(
+                (
+                    int(row["round_idx"]),
+                    float(row["arrival_time_ms"]),
+                    float(row["tool_wait_after_ms"]),
+                    int(row["input_len"]),
+                )
+            )
+    window_ms = workload.window_s * 1e3
+    free = [0.0] * workload.max_concurrency
+    ceiling_rounds = 0
+    ceiling_new = 0
+    # session_runner admits sessions in trace order (its AdmissionOrder).
+    for steps in sessions.values():
+        steps.sort()
+        t = max(steps[0][1], heapq.heappop(free))
+        for _, _, wait_ms, input_len in steps:
+            if t < window_ms:
+                ceiling_rounds += 1
+                ceiling_new += input_len
+            t += wait_ms
+        heapq.heappush(free, t)
+    return TraceFacts(rounds, len(sessions), ceiling_rounds, ceiling_new)
+
+
+def rounds_over_bound_that_fail(max_rounds: int, quantile: float = 0.99) -> int:
+    """Fewest rounds over a TTFT bound that put the p99 over it for any count <= max_rounds.
+
+    Independent of the bound's value (used with the 60 s rejection bound).
+    metrics.py takes numpy's linear-interpolation percentile over n counted
+    TTFTs: position h = q (n - 1) of the sorted values. When at least
+    n - floor(h) values exceed the bound, the value at floor(h) does, and so does
+    the interpolated percentile. That count grows with n, so its value at the
+    largest possible n holds for every smaller one.
+    """
+    n = max(max_rounds, 1)
+    return n - int(quantile * (n - 1))
+
+
+# ----------------------------------------------------------------------------- HTTP
+
+
+@dataclasses.dataclass(frozen=True)
+class Completion:
+    ttft_s: float
+    token_ids: list[int]
+    prompt_tokens: int | None
+    cached_tokens: int | None
+
+
+def split_base_url(base_url: str) -> tuple[str, int, str]:
+    parsed = urllib.parse.urlparse(base_url)
+    if parsed.scheme != "http" or parsed.hostname is None:
+        raise Rejected(f"--base-url must be http://host:port/v1, got {base_url!r}")
+    return parsed.hostname, parsed.port or 80, parsed.path.rstrip("/")
+
+
+def served_models(base_url: str, timeout_s: float) -> list[str]:
+    try:
+        with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=timeout_s) as resp:
+            body = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise Rejected(f"GET {base_url}/models failed: {exc}") from exc
+    return [entry.get("id") for entry in body.get("data", [])]
+
+
+def stream_completion(base_url: str, model: str, prompt: list[int], timeout_s: float) -> Completion:
+    """One streamed /completions request with token-ID prompt, 1 output token, temperature 0.
+
+    The same request shape session_runner sends (backend `openai`).
+    """
+    host, port, path = split_base_url(base_url)
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": True,
+        "ignore_eos": True,
+        "return_token_ids": True,
+        "stream_options": {"include_usage": True},
+    }
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
+    try:
+        start = time.perf_counter()
+        conn.request(
+            "POST", f"{path}/completions", body=json.dumps(payload), headers={"Content-Type": "application/json"}
+        )
+        resp = conn.getresponse()
+        if resp.status != 200:
+            raise Rejected(f"POST {path}/completions: HTTP {resp.status}: {resp.read()[:300]!r}")
+        ttft: float | None = None
+        token_ids: list[int] = []
+        usage: dict[str, Any] | None = None
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            event = json.loads(data)
+            for choice in event.get("choices") or []:
+                ids = choice.get("token_ids") or []
+                if ids and ttft is None:
+                    ttft = time.perf_counter() - start
+                token_ids.extend(int(i) for i in ids)
+            if event.get("usage"):
+                usage = event["usage"]
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        raise Rejected(f"screening request failed: {exc!r}") from exc
+    finally:
+        conn.close()
+    if ttft is None or not token_ids:
+        raise Rejected(
+            "screening: the server returned no generated token ids; it must honour "
+            "`return_token_ids` on streamed /v1/completions"
+        )
+    details = (usage or {}).get("prompt_tokens_details") or {}
+    return Completion(
+        ttft_s=ttft,
+        token_ids=token_ids,
+        prompt_tokens=(usage or {}).get("prompt_tokens"),
+        cached_tokens=details.get("cached_tokens"),
+    )
+
+
+# ----------------------------------------------------------------------------- screening
+
+
+def fresh_prompt(rng: random.Random, length: int) -> list[int]:
+    # Ordinary vocabulary ids, clear of the special tokens at the top of the vocabulary.
+    return [rng.randrange(1_000, 150_000) for _ in range(length)]
+
+
+def screen(base_url: str, model: str, workload: Workload) -> dict[str, float]:
+    """A few lone prompts on the idle server; rejects a server that cannot pass the run."""
+    # Seeded by the clock: no screening prompt repeats across evaluations or
+    # shares a prefix with the session prompts.
+    rng = random.Random(time.time_ns())
+    gate, info, append = workload.screen_gate_tokens, workload.screen_info_tokens, workload.screen_append_tokens
+    timeout = workload.request_timeout_s
+
+    first_prompt = fresh_prompt(rng, gate)
+    first = stream_completion(base_url, model, first_prompt, timeout)
+    if first.prompt_tokens != gate:
+        raise Rejected(f"screening: usage.prompt_tokens {first.prompt_tokens} for a {gate}-token prompt")
+    log(f"screen: lone {gate}-token prompt, TTFT {first.ttft_s:.3f} s")
+
+    # Round 1 of a session: the previous prompt, its output token, then new tokens.
+    follow = first_prompt + first.token_ids[:1] + fresh_prompt(rng, append - 1)
+    second = stream_completion(base_url, model, follow, timeout)
+    if second.cached_tokens is None:
+        raise Rejected(
+            "screening: the server reports no usage.prompt_tokens_details.cached_tokens "
+            "(vLLM: --enable-prompt-tokens-details); the run needs it"
+        )
+    if not 0 < second.cached_tokens <= gate:
+        raise Rejected(
+            f"screening: a follow-up round on a {gate}-token prefix reported {second.cached_tokens} "
+            f"cached tokens; expected a prefix-cache hit in (0, {gate}]"
+        )
+    log(f"screen: session follow-up, {second.cached_tokens} cached tokens, TTFT {second.ttft_s:.3f} s")
+
+    # The same check session_runner's preflight makes, so its failure has a precise reason.
+    probe = fresh_prompt(rng, workload.preflight_probe_tokens)
+    stream_completion(base_url, model, probe, timeout)
+    repeat = stream_completion(base_url, model, probe, timeout)
+    if not repeat.cached_tokens:
+        raise Rejected(
+            f"screening: an identical {len(probe)}-token prompt sent twice reported no cached tokens the "
+            f"second time, while a session follow-up on a {gate}-token prefix hit "
+            f"{second.cached_tokens}. The prefix cache resumes only at blocks longer than "
+            f"{len(probe)} tokens, so session_runner's prefix-cache preflight ({len(probe)}-token probe) "
+            "will abort the replay. Either serve hits below that block size, or build session_runner "
+            "with benchmark/request-factory-preflight-probe.patch (benchmark/README.md)."
+        )
+    log(f"screen: repeated {len(probe)}-token probe, {repeat.cached_tokens} cached tokens")
+
+    third = stream_completion(base_url, model, fresh_prompt(rng, gate), timeout)
+    best_gate = min(first.ttft_s, third.ttft_s)
+    log(f"screen: second lone {gate}-token prompt, TTFT {third.ttft_s:.3f} s")
+    bound = workload.reject_p99_ttft_s
+    if best_gate > bound:
+        raise Rejected(
+            f"screening: the best of two lone {gate}-token prompts on the idle server took "
+            f"{best_gate:.2f} s to the first token, above the {bound:.0f} s p99 bound that rejects a run. "
+            f"Over 1% of the run's rounds compute at least {gate} new tokens under load, so the run's "
+            "p99 would exceed it too (benchmark/README.md, Screening). The server is broken or far "
+            "too slow (a healthy build takes about 0.4 s).",
+            {"name": "screen_ttft_16k_s", "value": best_gate, "direction": "min", "unit": "s",
+             "target": SLO_P99_TTFT_S},
+        )
+    fourth = stream_completion(base_url, model, fresh_prompt(rng, info), timeout)
+    log(f"screen: lone {info}-token prompt, TTFT {fourth.ttft_s:.3f} s")
+    return {"screen_ttft_16k_s": best_gate, "screen_ttft_32k_s": fourth.ttft_s}
+
+
+# ----------------------------------------------------------------------------- replay
+
+
+@dataclasses.dataclass
+class LogWatch:
+    """Folds the growing request log; decides when failure is already certain."""
+
+    over_bound_limit: int
+    window_s: float
+    ttft_bound_s: float
+    rounds: int = 0
+    successes: int = 0
+    failures: int = 0
+    shortfall_rounds: int = 0
+    over_bound: int = 0
+    min_submit: float | None = None
+    first_failure: str | None = None
+    first_shortfall: str | None = None
+    new_tokens: int = 0
+    _buffer: str = ""
+    _offset: int = 0
+
+    def poll(self, path: Path) -> int:
+        """Read lines appended since the last poll; return how many records were new."""
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(self._offset)
+            chunk = handle.read()
+            self._offset = handle.tell()
+        self._buffer += chunk
+        *lines, self._buffer = self._buffer.split("\n")
+        for line in lines:
+            if line.strip():
+                self.add(json.loads(line))
+        return len([line for line in lines if line.strip()])
+
+    def add(self, record: dict[str, Any]) -> None:
+        self.rounds += 1
+        outcome = record.get("outcome", {})
+        source = (record.get("source") or {}).get("data") or {}
+        submit = outcome.get("submit_timestamp")
+        if submit is not None:
+            self.min_submit = submit if self.min_submit is None else min(self.min_submit, submit)
+        if str(outcome.get("status")).upper() != "SUCCESS":
+            self.failures += 1
+            if self.first_failure is None:
+                self.first_failure = (
+                    f"{outcome.get('request_id')}: status {outcome.get('status')}: {outcome.get('error')}"
+                )
+        else:
+            self.successes += 1
+            self.new_tokens += int(source.get("input_len") or 0)
+            ttft_ms = outcome.get("first_token_id_ms")
+            if ttft_ms is not None and outcome.get("post_timestamp") is not None:
+                first_token = outcome["post_timestamp"] + ttft_ms / 1e3
+                # Only rounds metrics.py can count: first token inside the window.
+                counted = self.min_submit is not None and first_token < self.min_submit + self.window_s
+                if counted and first_token - submit > self.ttft_bound_s:
+                    self.over_bound += 1
+        shortfall = int(source.get("prefix_shortfall_tokens") or 0)
+        if shortfall > 0:
+            self.shortfall_rounds += 1
+            if self.first_shortfall is None:
+                self.first_shortfall = f"{outcome.get('request_id')}: {shortfall} tokens"
+
+    def verdict(self) -> str | None:
+        """Why the run has already failed, or None while it can still pass."""
+        if self.failures:
+            return f"a request failed ({self.failures} so far); first: {self.first_failure}"
+        if self.shortfall_rounds:
+            return (
+                f"prefix_shortfall_tokens > 0 on {self.shortfall_rounds} round(s); first: "
+                f"{self.first_shortfall}. A round's prompt must carry the previous round's real "
+                "output token (`return_token_ids`)"
+            )
+        if self.over_bound >= self.over_bound_limit:
+            return (
+                f"{self.over_bound} rounds already took over {self.ttft_bound_s:.0f} s to the first token; "
+                f"with at most the zero-latency ceiling of rounds counted, {self.over_bound_limit} such "
+                f"rounds put the p99 TTFT over the {self.ttft_bound_s:.0f} s rejection bound"
+            )
+        return None
+
+
+def session_runner_argv(
+    engine: Path, trace: Path, text_file: Path, tokenizer: Path, base_url: str, model: str,
+    workload: Workload, work_dir: Path,
+) -> list[str]:
+    """The replay of reference/1_contract.md §2.2 as session_runner flags."""
+    return [
+        str(engine),
+        "--trace", str(trace),
+        "--input-file-format", TRACE_FORMAT,
+        "--text-file", str(text_file),
+        "--tokenizer", str(tokenizer),
+        "--base-url", base_url,
+        "--model", model,
+        "--backend", "openai",
+        "--temperature", "0",
+        "--arrival-mode", "trace-timed",
+        "--max-concurrency", str(workload.max_concurrency),
+        "--max-model-len", str(MAX_MODEL_LEN),
+        "--log-path", str(work_dir / "requests.jsonl"),
+        "--summary-path", str(work_dir / "session_runner_summary.json"),
+        "--timeline", "false",
+        "--timeline-path", str(work_dir / "timeline.parquet"),
+    ]
+
+
+def stop(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def stderr_tail(path: Path, limit: int = 3000) -> str:
+    if not path.exists():
+        return ""
+    data = path.read_bytes()[-limit:]
+    return data.decode("utf-8", errors="replace")
+
+
+def progress_partial(watch: LogWatch, facts: TraceFacts, elapsed_s: float) -> dict[str, Any] | None:
+    if watch.successes == 0 or elapsed_s <= 0:
+        return None
+    return {
+        "name": "new_tokens_per_s_so_far",
+        "value": watch.new_tokens / elapsed_s,
+        "direction": "max",
+        "unit": "new prompt tokens/s",
+        "target": SIM_TARGET_NEW_TOKENS_PER_S,
+        "progress": {"completed": min(watch.successes, facts.ceiling_rounds),
+                     "required": max(facts.ceiling_rounds, 1), "unit": "rounds"},
+    }
+
+
+def replay(argv: list[str], work_dir: Path, workload: Workload, facts: TraceFacts,
+           poll_s: float = 2.0) -> LogWatch:
+    """Run session_runner for the window and return the folded request log."""
+    log_path = work_dir / "requests.jsonl"
+    err_path = work_dir / "session_runner.stderr"
+    watch = LogWatch(over_bound_limit=rounds_over_bound_that_fail(facts.ceiling_rounds), window_s=workload.window_s,
+                     ttft_bound_s=workload.reject_p99_ttft_s)
+    log(f"replay: {' '.join(argv)}")
+    started = time.time()
+    last_record = started
+    with err_path.open("wb") as err, (work_dir / "session_runner.stdout").open("wb") as out:
+        proc = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
+    try:
+        while True:
+            exited = proc.poll() is not None
+            new = watch.poll(log_path)
+            now = time.time()
+            if new:
+                last_record = now
+            why = watch.verdict()
+            if why is not None:
+                elapsed = now - (watch.min_submit or started)
+                raise Rejected(f"run stopped early: {why}", progress_partial(watch, facts, elapsed))
+            if watch.min_submit is None:
+                if exited:
+                    raise Rejected(
+                        f"session_runner exited with code {proc.returncode} before any round "
+                        f"completed:\n{stderr_tail(err_path)}"
+                    )
+                if now - started > workload.startup_timeout_s:
+                    raise Rejected(
+                        f"no round completed within {workload.startup_timeout_s:.0f} s of starting "
+                        f"session_runner:\n{stderr_tail(err_path)}"
+                    )
+            else:
+                if now >= watch.min_submit + workload.window_s + workload.grace_s:
+                    log(f"replay: window closed after {now - watch.min_submit:.0f} s; stopping session_runner")
+                    break
+                if exited and proc.returncode == 0:
+                    log("replay: session_runner finished the whole workload inside the window")
+                    break
+                if exited:
+                    raise Rejected(
+                        f"session_runner exited with code {proc.returncode} "
+                        f"{now - watch.min_submit:.0f} s into the {workload.window_s:.0f} s window:\n"
+                        f"{stderr_tail(err_path)}",
+                        progress_partial(watch, facts, now - watch.min_submit),
+                    )
+                if now - last_record > workload.stall_timeout_s:
+                    raise Rejected(
+                        f"no round completed for {workload.stall_timeout_s:.0f} s; the server stalled",
+                        progress_partial(watch, facts, now - watch.min_submit),
+                    )
+            time.sleep(poll_s)
+    finally:
+        stop(proc)
+    watch.poll(log_path)
+    return watch
+
+
+def score(log_path: Path, workload: Workload) -> dict[str, Any]:
+    result = subprocess.run(
+        [sys.executable, str(METRICS_PY), str(log_path), "--minutes", str(workload.window_s / 60)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise Rejected(f"metrics.py failed (exit {result.returncode}): {result.stderr[-2000:]}")
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def judge(metrics: dict[str, Any], watch: LogWatch, facts: TraceFacts, workload: Workload,
+          screened: dict[str, float]) -> dict[str, float]:
+    """The run's result row, or `Rejected` when a gate fails.
+
+    Gates: no failed request, `prefix_shortfall_tokens` 0 on every round, at
+    least one counted round, and p99 TTFT within the rejection bound (60 s; the
+    same rule the early abort enforces, so the outcome does not depend on when
+    it is detected). The 6 s SLO is reported, not gated.
+    """
+    why = watch.verdict()
+    if why is not None:
+        raise Rejected(f"run rejected: {why}", progress_partial(watch, facts, workload.window_s))
+    if metrics["rounds"] == 0:
+        raise Rejected("no round was counted in the window")
+    p99 = metrics["ttft_s"]["p99"]
+    bound = workload.reject_p99_ttft_s
+    if p99 > bound:
+        raise Rejected(
+            f"run rejected: p99 TTFT {p99:.2f} s is over the {bound:.0f} s rejection bound "
+            f"(new tokens/s {metrics['new_tokens_per_s']:.0f}, p50/p90 {metrics['ttft_s']['p50']:.2f}/"
+            f"{metrics['ttft_s']['p90']:.2f} s, {metrics['rounds']} rounds)",
+            {"name": "p99_ttft_s", "value": p99, "direction": "min", "unit": "s", "target": SLO_P99_TTFT_S,
+             "progress": {"completed": min(metrics["rounds"], facts.ceiling_rounds),
+                          "required": max(facts.ceiling_rounds, 1), "unit": "rounds"}},
+        )
+    return {
+        "new_tokens_per_s": metrics["new_tokens_per_s"],
+        "p99_ttft_s": p99,
+        "slo_met": 1.0 if p99 <= SLO_P99_TTFT_S else 0.0,
+        "slo_margin_s": SLO_P99_TTFT_S - p99,
+        "p50_ttft_s": metrics["ttft_s"]["p50"],
+        "p90_ttft_s": metrics["ttft_s"]["p90"],
+        "max_ttft_s": metrics["ttft_s"]["max"],
+        "rounds_per_s": metrics["rounds_per_s"],
+        "computed_tokens_per_s": metrics["computed_tokens_per_s"],
+        "prefix_hit_share": metrics["prefix_hit_share"],
+        "rounds_ttft_over_60s": float(metrics["rounds_ttft_over_60s"]),
+        "fraction_of_sim_target": metrics["new_tokens_per_s"] / SIM_TARGET_NEW_TOKENS_PER_S,
+        "fraction_of_workload_ceiling": metrics["new_tokens_per_s"]
+        / max(facts.ceiling_new_tokens / workload.window_s, 1.0),
+        **screened,
+    }
+
+
+# ----------------------------------------------------------------------------- main
+
+
+def run(args: argparse.Namespace, workload: Workload, report: ProtocolReport) -> int:
+    work_dir = Path(args.work_dir) if args.work_dir else (
+        args.vs_output.parent / "session_replay" if args.vs_output else Path(tempfile.mkdtemp(prefix="session_replay-"))
+    )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    log(f"work dir: {work_dir}")
+    if args.preflight_probe_tokens is not None:
+        # A property of the session_runner build, not of the workload.
+        workload = dataclasses.replace(workload, preflight_probe_tokens=args.preflight_probe_tokens)
+    try:
+        engine = Path(args.request_factory_engine)
+        if not os.access(engine, os.X_OK):
+            raise Rejected(f"--request-factory-engine {engine} is not an executable")
+        trace = verify_trace(Path(args.asset_dir), workload)
+        verify_text(Path(args.text_file), workload)
+        tokenizer = resolve_tokenizer(Path(args.tokenizer) if args.tokenizer else None)
+        facts = trace_facts(trace, workload)
+        log(
+            f"trace: {facts.sessions} sessions, {facts.rounds} rounds; zero-latency ceiling in the window: "
+            f"{facts.ceiling_rounds} rounds, {facts.ceiling_new_tokens / workload.window_s:.0f} new tokens/s; "
+            f"early abort at {rounds_over_bound_that_fail(facts.ceiling_rounds)} rounds over "
+            f"{workload.reject_p99_ttft_s:.0f} s"
+        )
+        models = served_models(args.base_url, workload.request_timeout_s)
+        if args.model not in models:
+            raise Rejected(f"the server serves {models}, not --model {args.model!r}")
+
+        screened = screen(args.base_url, args.model, workload)
+
+        argv = session_runner_argv(
+            engine, trace, Path(args.text_file), tokenizer, args.base_url, args.model, workload, work_dir
+        )
+        watch = replay(argv, work_dir, workload, facts)
+        metrics = score(work_dir / "requests.jsonl", workload)
+        (work_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+        log(f"metrics.py: {json.dumps(metrics)}")
+
+        values = judge(metrics, watch, facts, workload, screened)
+        report.emit(values)
+        print(json.dumps(values, indent=2))
+        return 0
+    except Rejected as exc:
+        log(f"REJECTED: {exc}")
+        report.fail(str(exc), exc.partial)
+        return 1
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--base-url", required=True, help="OpenAI base URL, http://127.0.0.1:PORT/v1")
+    parser.add_argument("--model", default=MODEL, help="served model name (vibesys_serve.sh sets it)")
+    parser.add_argument("--request-factory-engine", required=True,
+                        help="session_runner built from request-factory 7f6aa9d8e36f3b81ae1f6c76c69f460f95f9c84c")
+    parser.add_argument("--text-file", required=True, help="enwik9 (1,000,000,000 bytes)")
+    parser.add_argument("--asset-dir", required=True,
+                        help="directory holding sessions_2ps.csv and sessions_2ps.manifest.json")
+    parser.add_argument("--tokenizer", default=None,
+                        help="tokenizer.json; default: the pinned revision in the Hugging Face cache")
+    parser.add_argument("--work-dir", default=None,
+                        help="where the request log and stderr go; default: next to --vs-output")
+    parser.add_argument("--preflight-probe-tokens", type=int, default=None,
+                        help="probe length of the session_runner build: 8192 at rev 7f6aa9d (default), "
+                             "32768 with benchmark/request-factory-preflight-probe.patch")
+    parser.add_argument("--vs-output", type=Path, default=None, help="result protocol v2 stream (VibeSys)")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    report = ProtocolReport(args.vs_output)
+    return run(args, WORKLOAD, report)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

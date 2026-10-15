@@ -22,7 +22,9 @@ python session_replay.py \
 
 Recording the replay reference (once, on the reference build, TP4+EP):
 the same flags with `--record-replay-reference <operator path>/replay_reference.json`
-instead of `--replay-reference` ("Replay answers" below).
+instead of `--replay-reference` ("Replay answers" below). It replays a seeded
+sample of sessions at low concurrency, not the scored run: about 11 minutes
+of replay on TP4+EP, plus screening and corpus tokenization.
 
 - The server must already be running. The script never starts one.
 - `--tokenizer` defaults to `tokenizer.json` of the pinned revision in the
@@ -103,7 +105,8 @@ Reported metrics: `p99_ttft_s` (primary objective) and `new_tokens_per_s`
 `fraction_of_sim_target` (new tokens/s over the design's 118.8k),
 `fraction_of_workload_ceiling` (over the zero-latency ceiling below),
 `screen_ttft_16k_s`, `screen_ttft_32k_s`, `replay_token_agreement`,
-`replay_matched_rounds` and `outstanding_rounds`.
+`replay_matched_rounds`, `replay_agreement_gate`, `replay_min_matched_rounds`
+(the two thresholds the replay answers were held to) and `outstanding_rounds`.
 
 An unexpected exception still ends with an `error` record ("benchmark error:
 ..."), so every run leaves an outcome.
@@ -123,16 +126,41 @@ exact prompt ids it sent, each as 4 little-endian bytes) and
 an opaque per-process keyed hash as its request id instead of
 `session_X_round_Y`.
 
-- `--record-replay-reference OUT` (reference build only): the normal run, then
-  writes `{session_id}/{round_idx} -> [prompt hash, first token]` for every
-  successful round. Rejected, writing nothing, on a failed request, a prefix
-  shortfall, or any other correctness gate; the p99 gates do not stop it (no
-  early abort).
+- `--record-replay-reference OUT` (reference build only): replays the sample
+  below and writes `{session_id}/{round_idx} -> [prompt hash, first token]`
+  for every sampled round, plus the sampling parameters and seed (`sampling`)
+  and the recording's own statistics (`recording`). No result row. Rejected,
+  writing nothing, on a failed request, a prefix shortfall, or any other
+  correctness gate.
 - `--replay-reference PATH` (every scored run; an operator path, never in the
   candidate tree): a round is *matched* when the reference has the same
-  session round with the same prompt hash. Rejected when under 95% of matched
-  rounds give the reference's first token, or under 1,000 rounds match.
-  Reported: `replay_token_agreement`, `replay_matched_rounds`.
+  session round with the same prompt hash. Rejected when under
+  `REPLAY_MIN_AGREEMENT` (90%) of matched rounds give the reference's first
+  token, or when fewer than `REPLAY_MIN_MATCHED_ROUNDS` (1,000) rounds match.
+  Reported: `replay_token_agreement`, `replay_matched_rounds` and both
+  thresholds; the log also names how many recorded rounds the run reached.
+
+**The sample** (`REPLAY_SAMPLE`: seed 20261015, 240 sessions, at most 32
+rounds each, 32 sessions at once). Recording the scored run itself on the
+reference build saturates it (p99 TTFT 302 s) and covers only the first
+~2,900 rounds, while candidates reach 17k-41k. The population is instead every
+session the zero-latency ceiling admits inside the window (1,679 sessions, in
+trace order): no candidate reaches a round outside it. It is cut into 240
+contiguous strata and one session is drawn from each with the seed, so the
+sample spans the first to the last admitted session. Each sampled session is
+replayed from round 0, since a round's prompt contains every earlier answer
+of the session, for the rounds the ceiling submits (median 16), at most 32:
+4,238 rounds, 17.7M new tokens. Deeper rounds are rarely matched, since any
+first-token flip ends a session's matched run.
+
+session_runner seeds a session's synthetic tokens from its ordinal (position
+in the trace) and the token pool's size, so the recording replays a derived
+trace that keeps every session up to the last sampled one in place (the
+others as one 1-token round 0, not recorded), zeroes tool waits, runs with
+arrival mode `saturated`, and both modes pin the pool with
+`--token-pool-limit 100000000` (its default for this trace). The prompts of
+sampled rounds are then exactly those of the scored run; the smoke test
+checks it end to end (its scored replay matches every recorded round).
 
 A flipped token changes every later prompt of its session, so later rounds
 are unmatched rather than wrong. Round 0 of every session depends only on the
@@ -215,4 +243,13 @@ path (the smoke workload lowers the 60 s bound to 8 s to keep cases short):
 
 ```bash
 python smoke/smoke_test.py --engine <session_runner> --tokenizer <tokenizer.json> --text-file <text>
+```
+
+`test_session_replay.py` (no server or engine; pytest or plain python) checks
+the recording sample (deterministic per seed, one session per stratum of the
+reachable sessions, each from round 0, ordinals kept in the derived trace)
+and the agreement gate and matched-round minimum over generated inputs:
+
+```bash
+python test_session_replay.py
 ```

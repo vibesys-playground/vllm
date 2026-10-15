@@ -11,7 +11,7 @@ on 4 x B200, scored on the handoff's 20-minute coding-agent session replay at
 | `/vibesys_serve.sh` (repository root) | candidate (agent-editable) | the server launch; baseline PP4 [12,11,11,11] |
 | `vibesys.input.toml`, `objectives.toml` | task | commands, timeouts, objectives |
 | `benchmark/` | task | `session_replay.py`, the handoff's `metrics.py`, the trace manifest pin, CPU smoke test |
-| `accuracy_checker/` | task | `checker.py`, `make_reference.py`, `reference.json` (generated once on GPUs) |
+| `accuracy_checker/` | task | `checker.py`, `make_reference.py` (`reference.json` is generated once on GPUs and kept at an operator path) |
 | `reference/` | task | the handoff's README, contract and pass-rule docs (4-7), small target files under `data/` |
 
 ## Interface
@@ -28,9 +28,10 @@ The checkpoint must be in the Hugging Face cache at revision
 `da920bb0b9f4a06727223a349e55468e38352348`.
 
 **Accuracy** (`accuracy_checker/checker.py`), operator appends:
-`--base-url http://127.0.0.1:PORT` (no `/v1`). Needs
-`accuracy_checker/reference.json`, made once with `make_reference.py`
-(`accuracy_checker/README.md`).
+`--base-url http://127.0.0.1:PORT` (no `/v1`) and
+`--reference <operator path>/reference.json`, made once with
+`make_reference.py` on the reference build (`accuracy_checker/README.md`).
+Keep it outside the candidate tree.
 
 **Benchmark** (`benchmark/session_replay.py`), operator appends:
 

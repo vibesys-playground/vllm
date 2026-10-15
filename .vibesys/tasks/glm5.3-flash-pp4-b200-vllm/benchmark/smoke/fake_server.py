@@ -18,7 +18,10 @@ Fault flags make the failure paths testable: --slow-every/--slow-ms (TTFT
 outliers), --fail-after (HTTP 500), --drop-token-ids-after (no generated ids:
 the client's next prompt comes up short), --canned (one fixed token for every
 prompt), --noise (perturbed logits), --no-cache-report, --fake-replay (streamed
-requests, the replay's shape, get a wrong token; non-streamed ones the right one).
+requests, the replay's shape, get a wrong token; non-streamed ones the right one),
+--truncate-over N (keep only the first N prompt tokens and count those),
+--text-only-after N (stream text but no token ids), --hang-at N,M,... (those
+requests never answer).
 """
 from __future__ import annotations
 
@@ -126,6 +129,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "injected failure"})
             return
         prompt = body["prompt"]
+        if args.truncate_over is not None and len(prompt) > args.truncate_over:
+            prompt = prompt[:args.truncate_over]
+        if n in args.hang_at:
+            time.sleep(3600)
         if body.get("model") != args.model:
             self._json(404, {"error": f"model {body.get('model')!r} not served"})
             return
@@ -143,13 +150,14 @@ class Handler(BaseHTTPRequestHandler):
         if not args.no_cache_report:
             usage["prompt_tokens_details"] = {"cached_tokens": cached}
         drop_ids = args.drop_token_ids_after is not None and n > args.drop_token_ids_after
+        text_only = args.text_only_after is not None and n > args.text_only_after
         if body.get("stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             choice = {"index": 0, "text": "" if drop_ids else "x", "finish_reason": None}
-            if body.get("return_token_ids") and not drop_ids:
+            if body.get("return_token_ids") and not drop_ids and not text_only:
                 choice["token_ids"] = [token]
             events = [{"choices": [choice]}, {"choices": [{"index": 0, "text": "", "finish_reason": "length"}]}]
             if (body.get("stream_options") or {}).get("include_usage"):
@@ -193,6 +201,9 @@ def main() -> None:
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--no-cache-report", action="store_true")
     parser.add_argument("--fake-replay", action="store_true")
+    parser.add_argument("--truncate-over", type=int, default=None)
+    parser.add_argument("--text-only-after", type=int, default=None)
+    parser.add_argument("--hang-at", type=lambda v: {int(x) for x in v.split(",")}, default=set())
     args = parser.parse_args()
     Handler.model = Model(args)
     server = Server(("127.0.0.1", args.port), Handler)

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Accuracy gate: the candidate's greedy first tokens against the reference build.
 
-    python checker.py --base-url http://127.0.0.1:PORT [--model NAME] [--report report.json]
+    python checker.py --base-url http://127.0.0.1:PORT --reference <operator path>/reference.json
+                      [--model NAME] [--report report.json]
 
 Exit status 0 = PASS, 1 = FAIL, 2 = the checker could not run (no reference.json).
 
@@ -40,6 +41,8 @@ from common import (  # noqa: E402
     MODEL, REFERENCE_VERSION, Answer, RequestError, complete, get_json, replay_shaped_token, unpack_ids,
 )
 
+# Fallback only: the operator passes --reference, a path outside the candidate
+# tree, so agents cannot read the expected answers (NOTES.md D15, R5).
 REFERENCE = Path(__file__).with_name("reference.json")
 
 # A flip is accepted only where the reference itself barely prefers its token:
@@ -175,9 +178,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base-url", required=True, help="http://127.0.0.1:PORT of the candidate (no /v1)")
     parser.add_argument("--model", default=MODEL)
-    parser.add_argument("--reference", type=Path, default=REFERENCE)
+    parser.add_argument("--reference", type=Path, default=None,
+                        help="the reference build's answers (operator path, outside the candidate tree); "
+                             "default: accuracy_checker/reference.json, with a warning")
     parser.add_argument("--report", type=Path, default=None, help="write the per-answer report here")
     args = parser.parse_args()
+    if args.reference is None:
+        args.reference = REFERENCE
+        print(f"WARNING: no --reference; falling back to the in-tree {REFERENCE}, which agents can read. "
+              "Pass the operator's copy.", file=sys.stderr)
     if not args.reference.is_file():
         print(f"FAIL: {args.reference} is missing; generate it with make_reference.py "
               "(accuracy_checker/README.md)", file=sys.stderr)

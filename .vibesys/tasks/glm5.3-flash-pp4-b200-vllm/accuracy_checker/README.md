@@ -7,12 +7,23 @@ without pipeline parallelism, TP4 with expert parallelism, FP8 KV cache).
 Exit 0 = pass, 1 = fail, 2 = `reference.json` missing or of another version.
 
 ```bash
-python checker.py --base-url http://127.0.0.1:PORT [--model nvidia/GLM-5.3-Flash-NVFP4] [--report report.json]
+python checker.py --base-url http://127.0.0.1:PORT --reference <operator path>/reference.json \
+  [--model nvidia/GLM-5.3-Flash-NVFP4] [--report report.json]
 ```
 
-The server must already be running. Requests are non-streaming
-`/v1/completions` with token-ID prompts, `max_tokens=1`, `temperature=0`,
-`logprobs=10`, `return_tokens_as_token_ids=true`, `return_token_ids=true`.
+`--reference` is an operator path outside the candidate tree, so agents cannot
+read the expected answers. Without it the checker falls back to
+`accuracy_checker/reference.json` and warns.
+
+The server must already be running. Each prompt is sent twice. First as a
+request shaped exactly like a benchmark replay round (streamed, `max_tokens=1`,
+`temperature=0`, `ignore_eos`, `return_token_ids`, the usage chunk, no logprobs,
+an opaque 32-hex-digit id in `rid` and `x-request-id`): its cached tokens are
+the ones checked, and its token must equal the second request's. Then
+non-streaming with `logprobs=10`, `return_tokens_as_token_ids=true`,
+`return_token_ids=true`, judged against the reference. A server therefore
+cannot answer the benchmark's request shape differently (NOTES.md D15).
+Per-request timeout: 1,200 s.
 
 ## Cases
 
@@ -82,7 +93,8 @@ python make_reference.py --base-url http://127.0.0.1:8000 --text-file <enwik9> \
   --reference-build "<vLLM commit, flags>" --output reference.json
 ```
 
-The file is about 4 MB. Commit it next to `checker.py`.
+The file is about 4 MB. Store it at an operator path outside the candidate tree
+and pass it with `--reference`; do not commit it.
 
 ## Smoke test (CPU)
 

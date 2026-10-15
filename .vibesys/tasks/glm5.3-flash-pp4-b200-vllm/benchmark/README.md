@@ -68,10 +68,33 @@ The 6 s p99 SLO is **not** a gate: a run that misses it is scored, and
 - any request failed (`status` not `SUCCESS`);
 - any round has `prefix_shortfall_tokens > 0` (its prompt could not carry the
   previous round's real output token);
+- a successful round streamed no generated token ids (`first_token_id_ms`
+  null: session_runner would carry re-encoded text forward, so no shortfall
+  shows, and metrics.py would drop the round);
+- a round's `usage.prompt_tokens` differs from `derived_prefix_len +
+  derived_append_len` (a truncated or miscounted prompt);
+- a round reports more cached tokens than its reusable prefix plus one, or a
+  session's round 0 more than 8,576 (one ~8.5k-token block): cache state
+  carried in from outside the evaluation. Every evaluation sends the same
+  prompts, so a cache kept across evaluations would score work done earlier;
+- the replay answers disagree with the reference run ("Replay answers");
 - screening fails (no token ids, wrong prompt count, no cached-token report, a
   prefix cache that does not hit, or a lone 16k prompt over 60 s);
 - p99 TTFT exceeds 60 s (hopeless; the early abort below usually catches it
   first), or no round was counted.
+
+**Outstanding rounds.** metrics.py counts a round only when its first token
+arrives inside the window, so a round still unanswered at the window's end
+would vanish from the TTFT percentiles, and a server could starve a few slow
+rounds to cut its p99. The TTFT percentiles reported here (p50, p90, p99, max)
+are metrics.py's over the counted rounds plus every outstanding round, each
+counted as at least (window end - its submit): logged rounds answered after
+the window (their real TTFT), each logged session's next round (submitted at
+its last round's completion plus that round's tool wait), and sessions
+session_runner had admitted but never logged (admission replayed first come,
+first served over the 500 slots). `outstanding_rounds` reports their number;
+with none, the percentiles equal metrics.py's (checked). Throughput metrics
+are metrics.py's unchanged.
 
 Reported metrics: `p99_ttft_s` (primary objective) and `new_tokens_per_s`
 (second objective), `slo_met` (1 when p99 TTFT <= 6 s, else 0), `slo_margin_s`
@@ -79,7 +102,11 @@ Reported metrics: `p99_ttft_s` (primary objective) and `new_tokens_per_s`
 `computed_tokens_per_s`, `prefix_hit_share`, `rounds_ttft_over_60s`,
 `fraction_of_sim_target` (new tokens/s over the design's 118.8k),
 `fraction_of_workload_ceiling` (over the zero-latency ceiling below),
-`screen_ttft_16k_s` and `screen_ttft_32k_s`.
+`screen_ttft_16k_s`, `screen_ttft_32k_s`, `replay_token_agreement`,
+`replay_matched_rounds` and `outstanding_rounds`.
+
+An unexpected exception still ends with an `error` record ("benchmark error:
+..."), so every run leaves an outcome.
 
 **Workload ceiling.** Replaying the trace's closed loop with every TTFT at
 zero (first-come-first-served slots, tool waits, 500 slots) admits 41,444

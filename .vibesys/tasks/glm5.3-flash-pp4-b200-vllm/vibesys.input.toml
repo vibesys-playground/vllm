@@ -17,7 +17,7 @@ command = [
   "--with-requirements", "${PROJECT_ROOT}/.vibesys/tasks/glm5.3-flash-pp4-b200-vllm/requirements.txt",
   "python", "${PROJECT_ROOT}/.vibesys/tasks/glm5.3-flash-pp4-b200-vllm/accuracy_checker/checker.py",
 ]
-timeout_seconds = 600
+timeout_seconds = 1200
 
 [benchmark]
 # Screening (seconds), corpus tokenization (about 1-3 min), the 20-minute

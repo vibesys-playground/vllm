@@ -97,7 +97,7 @@ class Model:
             noise = random.Random(seed ^ 0x5EED)
             scores = [s + noise.gauss(0.0, self.args.noise) for s in scores]
         log_z = math.log(sum(math.exp(s) for s in scores))
-        return {t: s - log_z for t, s in zip(tokens, scores)}
+        return {t: s - log_z for t, s in zip(tokens, scores, strict=True)}
 
 
 class Handler(BaseHTTPRequestHandler):

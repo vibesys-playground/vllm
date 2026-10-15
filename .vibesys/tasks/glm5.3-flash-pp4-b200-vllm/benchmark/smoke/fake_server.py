@@ -21,7 +21,8 @@ prompt), --noise (perturbed logits), --no-cache-report, --fake-replay (streamed
 requests, the replay's shape, get a wrong token; non-streamed ones the right one),
 --truncate-over N (keep only the first N prompt tokens and count those),
 --text-only-after N (stream text but no token ids), --hang-at N,M,... (those
-requests never answer).
+requests never answer), --cached-path-shift (a prompt that resumes a cached prefix
+gets a different answer than the same prompt computed cold, as on the GPU builds).
 """
 from __future__ import annotations
 
@@ -75,10 +76,12 @@ class Model:
             self.blocks.update(hashes)
         return min(hit, max(len(prompt) - 1, 0))
 
-    def logits(self, prompt: list[int]) -> dict[int, float]:
+    def logits(self, prompt: list[int], cached: int = 0) -> dict[int, float]:
         if self.args.canned:
             return {4242: 0.0, 4243: -3.0}
         seed = int.from_bytes(hashlib.sha256(json.dumps(prompt).encode()).digest()[:8], "big")
+        if self.args.cached_path_shift and cached > 0:
+            seed ^= 1
         rng = random.Random(seed)
         tokens = [rng.randrange(1_000, 150_000) for _ in range(CANDIDATES)]
         scores = [rng.gauss(0.0, 2.0) for _ in range(CANDIDATES)]
@@ -141,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
         if args.slow_every and n % args.slow_every == 0:
             delay_s += args.slow_ms / 1e3
         time.sleep(delay_s)
-        logits = self.model.logits(prompt)
+        logits = self.model.logits(prompt, cached)
         token = max(logits, key=logits.get)
         if args.fake_replay and body.get("stream"):
             # A gaming server: skip the work on the shape the replay sends.
@@ -201,6 +204,7 @@ def main() -> None:
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--no-cache-report", action="store_true")
     parser.add_argument("--fake-replay", action="store_true")
+    parser.add_argument("--cached-path-shift", action="store_true")
     parser.add_argument("--truncate-over", type=int, default=None)
     parser.add_argument("--text-only-after", type=int, default=None)
     parser.add_argument("--hang-at", type=lambda v: {int(x) for x in v.split(",")}, default=set())

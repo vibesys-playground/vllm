@@ -7,7 +7,10 @@
   4. fails it with large logit noise (1.5 nats),
   5. fails a server that answers one canned token for every prompt,
   6. fails a server that does not report cached tokens (no prefix-cache hit),
-  7. fails a server that answers replay-shaped (streamed) requests differently.
+  7. fails a server that answers replay-shaped (streamed) requests differently,
+  8. passes two checker runs on one server (per-run cache_salt),
+  9. passes a server whose cached-prefix resume changes the answer, with a reference
+     made through the cached path, and fails it with a reference made cold.
 
 usage: smoke_test.py --text-file <enwik9>
 """
@@ -30,7 +33,7 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def with_server(flags: list[str], command: list[str]) -> subprocess.CompletedProcess[str]:
+def with_server(flags: list[str], command: list[str], runs: int = 1) -> subprocess.CompletedProcess[str]:
     port = free_port()
     server = subprocess.Popen([sys.executable, str(FAKE), "--port", str(port), *flags],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -38,7 +41,11 @@ def with_server(flags: list[str], command: list[str]) -> subprocess.CompletedPro
         assert server.stdout is not None
         server.stdout.readline()
         argv = [a.replace("{URL}", f"http://127.0.0.1:{port}") for a in command]
-        return subprocess.run(argv, capture_output=True, text=True, timeout=900, check=False)
+        for _ in range(runs):
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=900, check=False)
+            if result.returncode != 0:
+                break
+        return result
     finally:
         server.terminate()
         server.wait()
@@ -59,8 +66,10 @@ def main() -> int:
     cases = [("clean", [], 0), ("small-noise", ["--noise", "0.02"], 0), ("large-noise", ["--noise", "1.5"], 1),
              ("canned", ["--canned"], 1), ("no-cache-report", ["--no-cache-report"], 1),
              ("fake-replay", ["--fake-replay"], 1)]
+    # A checker run, then a second one on the same server (its cache kept): both pass.
+    cases.append(("repeat-run", [], 0))
     for name, flags, expected in cases:
-        result = with_server(flags, checker)
+        result = with_server(flags, checker, runs=2 if name == "repeat-run" else 1)
         verdict = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
         brief = [line for line in result.stdout.splitlines() if '"failures"' in line or "near_ties" in line
                  or "mean_abs" in line]
@@ -71,6 +80,18 @@ def main() -> int:
         assert result.returncode == expected, (name, result.stdout[-2000:], result.stderr[-2000:])
         if name == "fake-replay":
             assert "the replay-shaped request answered 4242" in result.stdout, result.stdout[-2000:]
+    # A server whose cached-prefix resume answers differently: the reference made
+    # through the cached path still passes it.
+    shifted = root / "reference_shifted.json"
+    made = with_server(["--cached-path-shift"], [sys.executable, str(HERE / "make_reference.py"), "--base-url",
+                                                  "{URL}", "--text-file", ns.text_file, "--output", str(shifted)])
+    assert made.returncode == 0, made
+    result = with_server(["--cached-path-shift"], [*checker[:-1], str(shifted)])
+    print(f"--- cached-path-shift: exit {result.returncode}")
+    assert result.returncode == 0, result.stdout[-2000:]
+    stale = with_server(["--cached-path-shift"], checker)
+    print(f"--- cached-path-shift against a cold-path reference: exit {stale.returncode}")
+    assert stale.returncode == 1, stale.stdout[-2000:]
     print("ALL CHECKER SMOKE CASES PASSED")
     return 0
 

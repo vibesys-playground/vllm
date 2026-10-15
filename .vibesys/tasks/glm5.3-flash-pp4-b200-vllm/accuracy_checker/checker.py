@@ -11,15 +11,19 @@ Cases (reference/1_contract.md §4, accuracy_checker/README.md): lone prompts of
 prefix; and round-1 prompts sent cold, without a prefix in the cache. Every
 prompt is enwik9 text as token ids, stored in reference.json.
 
-Per answer (the first generated token and its top-10 logprobs):
-  match     the candidate's greedy token is the reference's.
+Per answer (the first generated token and its top-10 logprobs; the reference
+asked each answer several times, reference format 2):
+  match     the candidate's greedy token is one the reference gave in a repeat.
   near tie  it differs, but it is in the reference's top 10 and the reference
             ranked it within NEAR_TIE_NATS of its own top token.
   mismatch  anything else. One mismatch fails the check.
   logprob   the candidate's logprob of the reference's top token is within
-            MAX_ABS_DLOGPROB of the reference's, and the mean over answers within
-            MEAN_ABS_DLOGPROB. The reference token missing from the candidate's
-            top 10 is a mismatch.
+            MAX_ABS_DLOGPROB of the range the reference's repeats spanned, and
+            the mean over answers within MEAN_ABS_DLOGPROB. The reference token
+            missing from the candidate's top 10 is a mismatch.
+The logprob requests of one checker run share a random `cache_salt`, so a
+cached round 1 resumes this run's round 0 and never a previous run's cache: the
+checker can run repeatedly on one server.
 Every prompt is also sent first as a request shaped exactly like a benchmark
 replay round (streamed, no logprobs, opaque id); its token must equal the
 logprob request's, so a server cannot serve the benchmark's request shape a
@@ -33,6 +37,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import secrets
 import sys
 from pathlib import Path
 
@@ -75,11 +80,13 @@ class Verdict:
 def judge(name: str, expect: dict, answer: Answer, prompt_len: int) -> Verdict:
     ref_top = {int(t): float(lp) for t, lp in expect["top"]}
     expected = int(expect["token"])
+    accepted = {int(t) for t in expect.get("tokens", [expected])}
+    lo, hi = expect.get("lp_range", [ref_top[expected], ref_top[expected]])
     problems: list[str] = []
     if answer.prompt_tokens != prompt_len:
         problems.append(f"usage.prompt_tokens {answer.prompt_tokens} for a {prompt_len}-token prompt")
     gap = None
-    if answer.token == expected:
+    if answer.token in accepted:
         kind = "match"
     elif answer.token in ref_top and ref_top[expected] - ref_top[answer.token] <= NEAR_TIE_NATS:
         kind = "near_tie"
@@ -89,12 +96,27 @@ def judge(name: str, expect: dict, answer: Answer, prompt_len: int) -> Verdict:
         gap = ref_top[expected] - ref_top[answer.token] if answer.token in ref_top else None
     dlp = None
     if expected in answer.top:
-        dlp = answer.top[expected] - ref_top[expected]
+        # Distance to the range the reference's own repeats spanned (0 inside it).
+        got = answer.top[expected]
+        dlp = got - min(max(got, lo), hi)
         if abs(dlp) > MAX_ABS_DLOGPROB:
             problems.append(f"logprob of the reference token differs by {dlp:+.3f} nats")
     else:
         problems.append("the reference's greedy token is not in the candidate's top logprobs")
     return Verdict(name, expected, answer.token, kind, gap, dlp, answer.cached_tokens, answer.seconds, problems)
+
+
+def replay_shaped_kind(expect: dict, token: int, logprob_token: int) -> str | None:
+    """None when the replay-shaped answer is acceptable: the logprob request's token,
+    a token the reference gave, or a near tie of the reference's top token."""
+    ref_top = {int(t): float(lp) for t, lp in expect["top"]}
+    expected = int(expect["token"])
+    if token == logprob_token or token in {int(t) for t in expect.get("tokens", [expected])}:
+        return None
+    if token in ref_top and ref_top[expected] - ref_top[token] <= NEAR_TIE_NATS:
+        return None
+    return (f"the replay-shaped request answered {token}, the logprob request {logprob_token}: "
+            "neither the reference's answer nor a near tie")
 
 
 def run(base_url: str, model: str, reference: dict, log=print) -> tuple[bool, dict]:
@@ -104,15 +126,19 @@ def run(base_url: str, model: str, reference: dict, log=print) -> tuple[bool, di
         return False, {"error": f"server serves {served}, not {model!r}"}
     verdicts: list[Verdict] = []
     hit_problems: list[str] = []
+    run_salt = secrets.token_hex(16)
 
     def check(name: str, expect: dict, prompt: list[int]) -> Verdict:
-        # The replay-shaped request goes first, so it sees the cache state the case
-        # sets up (cold, or round 0 cached); the logprob request then repeats it.
-        shaped, shaped_prompt_tokens, shaped_cached = replay_shaped_token(base, model, prompt, REQUEST_TIMEOUT_S)
-        verdict = judge(name, expect, complete(base, model, prompt, REQUEST_TIMEOUT_S), len(prompt))
-        verdict.cached_tokens = shaped_cached
-        if shaped != verdict.got:
-            verdict.problems.append(f"the replay-shaped request answered {shaped}, the logprob request {verdict.got}")
+        # The replay-shaped request carries no salt (the replay sends none), so on a
+        # server that already ran the checker it may resume an earlier run's cache:
+        # it is judged against the reference with the near-tie tolerance, not by
+        # equality. The salted logprob request's cached tokens are the ones checked.
+        shaped, shaped_prompt_tokens, _ = replay_shaped_token(base, model, prompt, REQUEST_TIMEOUT_S)
+        answer = complete(base, model, prompt, REQUEST_TIMEOUT_S, cache_salt=run_salt)
+        verdict = judge(name, expect, answer, len(prompt))
+        shaped_problem = replay_shaped_kind(expect, shaped, verdict.got)
+        if shaped_problem is not None:
+            verdict.problems.append(shaped_problem)
         if shaped_prompt_tokens != len(prompt):
             verdict.problems.append(f"replay-shaped request: usage.prompt_tokens {shaped_prompt_tokens} for a "
                                     f"{len(prompt)}-token prompt")

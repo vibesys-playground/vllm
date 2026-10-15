@@ -40,15 +40,26 @@ with the benchmark's prompts, which come from the first ~100M tokens).
 Round 1 is round 0's prompt, the reference's greedy token, then A - 1 new
 tokens. About 1M prompt tokens in all; the baseline should take 1-3 minutes.
 
-The reference sends every request with its own `cache_salt`, so each of its
-answers is computed with no cache, and asks each lone prompt twice to record
-its own run-to-run noise (`self_noise_*` in the file).
+`make_reference.py` asks every answer `--repeats` times (default 3), each
+repeat under a fresh `cache_salt`, and stores per answer the tokens the
+repeats gave (`tokens`) and the range of the first repeat's token's logprob
+(`lp_range`): the reference build is bit-stable up to about 2k tokens and
+noisy beyond (a 64k answer flipped between two tokens across runs; logprobs
+swing ~0.3 nats at 16k). Lone prompts and cold round 1s are computed from
+scratch. A cached session's round 1 is recorded through the cached path, round
+0 then round 1 under one salt, because resuming a cached prefix can change the
+answer (on both builds, `session_p32k_a1k_cached` round 1 answers 2999 cached
+and 5726 cold).
+
+The checker's logprob requests in one run share a random `cache_salt`, so a
+cached round 1 resumes this run's round 0 and never an earlier run's cache, and
+the checker can run several times on one server.
 
 ## Pass rule and why
 
 For each answer:
 
-- **match**: the candidate's token is the reference's;
+- **match**: the candidate's token is one the reference gave over its repeats;
 - **near tie**: it differs, but the reference ranked it within **0.3 nats** of
   its own top token (a probability ratio of 1.35). NVFP4 weights with a
   different parallel layout change the order of reductions, so two candidates
@@ -58,8 +69,14 @@ For each answer:
 And over the logprobs:
 
 - the reference's token must be in the candidate's top 10;
-- the candidate's logprob of it within **1.0 nat** of the reference's on every
-  answer, and within **0.25 nats** on average.
+- the candidate's logprob of it within **1.0 nat** of the range the reference's
+  repeats spanned on every answer, and within **0.25 nats** on average (the
+  distance is 0 inside the range).
+
+The replay-shaped request's token must be the logprob request's, a token the
+reference gave, or a near tie of the reference's top token. It carries no
+salt (the replay sends none), so on a server that already ran the checker it
+may resume the earlier run's cache, hence the tolerance instead of equality.
 
 The server must also count every prompt token in `usage.prompt_tokens`, return
 the generated token id, report cached tokens for each cached round 1 with at
@@ -90,7 +107,7 @@ vllm serve nvidia/GLM-5.3-Flash-NVFP4 --revision da920bb0b9f4a06727223a349e55468
   --tensor-parallel-size 4 --enable-expert-parallel --kv-cache-dtype fp8_e4m3 \
   --max-model-len 1048576 --enable-prompt-tokens-details --port 8000
 python make_reference.py --base-url http://127.0.0.1:8000 --text-file <enwik9> \
-  --reference-build "<vLLM commit, flags>" --output reference.json
+  --reference-build "<vLLM commit, flags>" --repeats 3 --output reference.json
 ```
 
 The file is about 4 MB. Store it at an operator path outside the candidate tree

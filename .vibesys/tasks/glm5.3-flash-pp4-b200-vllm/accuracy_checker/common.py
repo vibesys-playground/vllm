@@ -15,7 +15,9 @@ from typing import Any
 
 MODEL = "nvidia/GLM-5.3-Flash-NVFP4"
 MODEL_REVISION = "da920bb0b9f4a06727223a349e55468e38352348"
-REFERENCE_VERSION = 1
+# 2: each answer holds the tokens observed over repeats and the logprob range of its token;
+# cached round-1 answers are recorded through the cached path.
+REFERENCE_VERSION = 2
 # Top-k logprobs stored per case (vLLM's default --max-logprobs is 20).
 TOP_K = 10
 

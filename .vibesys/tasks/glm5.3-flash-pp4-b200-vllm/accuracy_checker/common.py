@@ -17,7 +17,8 @@ MODEL = "nvidia/GLM-5.3-Flash-NVFP4"
 MODEL_REVISION = "da920bb0b9f4a06727223a349e55468e38352348"
 # 2: each answer holds the tokens observed over repeats and the logprob range of its token;
 # cached round-1 answers are recorded through the cached path.
-REFERENCE_VERSION = 2
+# 3: each answer slot holds one such record per trusted build (`builds`), keyed by build id.
+REFERENCE_VERSION = 3
 # Top-k logprobs stored per case (vLLM's default --max-logprobs is 20).
 TOP_K = 10
 
@@ -71,6 +72,55 @@ SESSIONS: tuple[Session, ...] = (
 # prompt can share a prefix with a benchmark prompt on a server that serves both.
 TEXT_START = 600_000_000
 TEXT_STRIDE = 4_000_000
+
+
+def answer_slots(case: dict[str, Any]) -> tuple[str, ...]:
+    """The keys of a case's answer slots, each {build id: record}."""
+    return ("expect",) if case["kind"] == "single" else ("expect_round0", "expect_round1")
+
+
+class ReferenceError(Exception):
+    """reference.json is not a valid current-format reference; the message names the offending key."""
+
+
+def validate_reference(reference: dict[str, Any]) -> list[str]:
+    """Check a format-3 reference; return its build ids.
+
+    Every answer slot (and a session's `round1_cached_tokens`) must hold
+    exactly one record per declared build, so no build silently covers only
+    some cases.
+    """
+    if reference.get("version") != REFERENCE_VERSION:
+        raise ReferenceError(f"version {reference.get('version')!r}, expected {REFERENCE_VERSION} (a format-2 "
+                             "file converts with make_reference.py --merge OLD --existing-build-id ID)")
+    builds = [build.get("id") for build in reference.get("builds") or []]
+    if not builds or len(set(builds)) != len(builds) or not all(isinstance(b, str) and b for b in builds):
+        raise ReferenceError(f"`builds` must list distinct non-empty ids, got {builds}")
+    for case in reference.get("cases") or []:
+        keys = list(answer_slots(case)) + (["round1_cached_tokens"] if case["kind"] == "session" else [])
+        for key in keys:
+            if sorted(case.get(key) or {}) != sorted(builds):
+                raise ReferenceError(f"case {case.get('name')!r} `{key}` has builds {sorted(case.get(key) or {})}, "
+                                     f"the file declares {sorted(builds)}")
+    return builds
+
+
+def upgrade_v2(reference: dict[str, Any], build_id: str) -> dict[str, Any]:
+    """A format-2 reference (one unnamed build) as format 3, its build named `build_id`."""
+    if reference.get("version") != 2:
+        raise ReferenceError(f"version {reference.get('version')!r} is not 2")
+    build = {"id": build_id, **{key: reference.get(key) for key in (
+        "reference_build", "created", "seconds", "repeats", "self_noise_max_abs_dlogprob", "self_noise_token_flips")}}
+    cases = []
+    for case in reference["cases"]:
+        out = {key: value for key, value in case.items() if key != "repeat_token"}
+        for key in answer_slots(case):
+            out[key] = {build_id: case[key]}
+        if case["kind"] == "session":
+            out["round1_cached_tokens"] = {build_id: case.get("round1_cached_tokens")}
+        cases.append(out)
+    return {"version": REFERENCE_VERSION, "model": reference["model"], "revision": reference["revision"],
+            "top_k": reference["top_k"], "builds": [build], "cases": cases}
 
 
 def pack_ids(ids: list[int]) -> str:

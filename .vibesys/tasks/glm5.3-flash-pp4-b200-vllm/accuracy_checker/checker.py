@@ -11,8 +11,10 @@ Cases (reference/1_contract.md §4, accuracy_checker/README.md): lone prompts of
 prefix; and round-1 prompts sent cold, without a prefix in the cache. Every
 prompt is enwik9 text as token ids, stored in reference.json.
 
-Per answer (the first generated token and its top-10 logprobs; the reference
-asked each answer several times, reference format 2):
+Per answer (the first generated token and its top-10 logprobs), against each
+trusted build in the reference (format 3: each build asked each answer
+several times), judged by the build it fits best; an answer passes if it fits
+any one build within that build's own repeat noise:
   match     the candidate's greedy token is one the reference gave in a repeat.
   near tie  it differs, but it is in the reference's top 10 and the reference
             ranked it within NEAR_TIE_NATS of its own top token.
@@ -21,6 +23,7 @@ asked each answer several times, reference format 2):
             MAX_ABS_DLOGPROB of the range the reference's repeats spanned, and
             the mean over answers within MEAN_ABS_DLOGPROB. The reference token
             missing from the candidate's top 10 is a mismatch.
+The report names the build each answer was judged against (`build`).
 The logprob requests of one checker run share a random `cache_salt`, so a
 cached round 1 resumes this run's round 0 and never a previous run's cache: the
 checker can run repeatedly on one server.
@@ -43,7 +46,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
-    MODEL, REFERENCE_VERSION, Answer, RequestError, complete, get_json, replay_shaped_token, unpack_ids,
+    MODEL, Answer, ReferenceError, RequestError, complete, get_json, replay_shaped_token, unpack_ids,
+    validate_reference,
 )
 
 # Fallback only: the operator passes --reference, a path outside the candidate
@@ -67,6 +71,8 @@ REQUEST_TIMEOUT_S = 1200.0
 @dataclasses.dataclass
 class Verdict:
     name: str
+    # The trusted build this answer was judged against (the one it fits best).
+    build: str
     expected: int
     got: int
     kind: str  # match, near_tie, mismatch
@@ -77,7 +83,7 @@ class Verdict:
     problems: list[str]
 
 
-def judge(name: str, expect: dict, answer: Answer, prompt_len: int) -> Verdict:
+def judge(name: str, build: str, expect: dict, answer: Answer, prompt_len: int) -> Verdict:
     ref_top = {int(t): float(lp) for t, lp in expect["top"]}
     expected = int(expect["token"])
     accepted = {int(t) for t in expect.get("tokens", [expected])}
@@ -103,18 +109,36 @@ def judge(name: str, expect: dict, answer: Answer, prompt_len: int) -> Verdict:
             problems.append(f"logprob of the reference token differs by {dlp:+.3f} nats")
     else:
         problems.append("the reference's greedy token is not in the candidate's top logprobs")
-    return Verdict(name, expected, answer.token, kind, gap, dlp, answer.cached_tokens, answer.seconds, problems)
+    return Verdict(name, build, expected, answer.token, kind, gap, dlp, answer.cached_tokens, answer.seconds,
+                   problems)
 
 
-def replay_shaped_kind(expect: dict, token: int, logprob_token: int) -> str | None:
+KIND_RANK = {"match": 0, "near_tie": 1, "mismatch": 2}
+
+
+def judge_builds(name: str, expects: dict[str, dict], answer: Answer, prompt_len: int) -> Verdict:
+    """The answer judged against every trusted build; the verdict of the build it fits best.
+
+    Best = passes (not a mismatch, no problem) first, then match before near
+    tie, then the smallest logprob distance to that build's repeat range.
+    """
+    verdicts = [judge(name, build, expect, answer, prompt_len) for build, expect in expects.items()]
+    return min(verdicts, key=lambda v: (v.kind == "mismatch" or bool(v.problems), KIND_RANK[v.kind],
+                                        abs(v.dlogprob) if v.dlogprob is not None else float("inf")))
+
+
+def replay_shaped_kind(expects: dict[str, dict], token: int, logprob_token: int) -> str | None:
     """None when the replay-shaped answer is acceptable: the logprob request's token,
-    a token the reference gave, or a near tie of the reference's top token."""
-    ref_top = {int(t): float(lp) for t, lp in expect["top"]}
-    expected = int(expect["token"])
-    if token == logprob_token or token in {int(t) for t in expect.get("tokens", [expected])}:
+    a token some trusted build gave, or a near tie of some build's top token."""
+    if token == logprob_token:
         return None
-    if token in ref_top and ref_top[expected] - ref_top[token] <= NEAR_TIE_NATS:
-        return None
+    for expect in expects.values():
+        ref_top = {int(t): float(lp) for t, lp in expect["top"]}
+        expected = int(expect["token"])
+        if token in {int(t) for t in expect.get("tokens", [expected])}:
+            return None
+        if token in ref_top and ref_top[expected] - ref_top[token] <= NEAR_TIE_NATS:
+            return None
     return (f"the replay-shaped request answered {token}, the logprob request {logprob_token}: "
             "neither the reference's answer nor a near tie")
 
@@ -128,15 +152,15 @@ def run(base_url: str, model: str, reference: dict, log=print) -> tuple[bool, di
     hit_problems: list[str] = []
     run_salt = secrets.token_hex(16)
 
-    def check(name: str, expect: dict, prompt: list[int]) -> Verdict:
+    def check(name: str, expects: dict[str, dict], prompt: list[int]) -> Verdict:
         # The replay-shaped request carries no salt (the replay sends none), so on a
         # server that already ran the checker it may resume an earlier run's cache:
         # it is judged against the reference with the near-tie tolerance, not by
         # equality. The salted logprob request's cached tokens are the ones checked.
         shaped, shaped_prompt_tokens, _ = replay_shaped_token(base, model, prompt, REQUEST_TIMEOUT_S)
         answer = complete(base, model, prompt, REQUEST_TIMEOUT_S, cache_salt=run_salt)
-        verdict = judge(name, expect, answer, len(prompt))
-        shaped_problem = replay_shaped_kind(expect, shaped, verdict.got)
+        verdict = judge_builds(name, expects, answer, len(prompt))
+        shaped_problem = replay_shaped_kind(expects, shaped, verdict.got)
         if shaped_problem is not None:
             verdict.problems.append(shaped_problem)
         if shaped_prompt_tokens != len(prompt):
@@ -144,7 +168,7 @@ def run(base_url: str, model: str, reference: dict, log=print) -> tuple[bool, di
                                     f"{len(prompt)}-token prompt")
         verdicts.append(verdict)
         flag = "" if verdict.kind == "match" and not verdict.problems else f"  <-- {verdict.kind} {verdict.problems}"
-        log(f"{name}: expected {verdict.expected} got {verdict.got} "
+        log(f"{name}: expected {verdict.expected} ({verdict.build}) got {verdict.got} "
             f"dlogprob {verdict.dlogprob if verdict.dlogprob is None else round(verdict.dlogprob, 4)} "
             f"cached {verdict.cached_tokens} ({verdict.seconds:.2f} s){flag}")
         return verdict
@@ -193,7 +217,10 @@ def run(base_url: str, model: str, reference: dict, log=print) -> tuple[bool, di
         "mismatches": len(mismatches),
         "mean_abs_dlogprob": mean_dlp,
         "max_abs_dlogprob": max(dlps, default=float("inf")),
-        "reference_self_noise_max_abs_dlogprob": reference.get("self_noise_max_abs_dlogprob"),
+        "builds": {b["id"]: b.get("reference_build") for b in reference["builds"]},
+        "answers_by_build": {b["id"]: sum(v.build == b["id"] for v in verdicts) for b in reference["builds"]},
+        "reference_self_noise_max_abs_dlogprob": {b["id"]: b.get("self_noise_max_abs_dlogprob")
+                                                  for b in reference["builds"]},
         "failures": failures,
         "verdicts": [dataclasses.asdict(v) for v in verdicts],
     }
@@ -218,8 +245,10 @@ def main() -> int:
               "(accuracy_checker/README.md)", file=sys.stderr)
         return 2
     reference = json.loads(args.reference.read_text())
-    if reference.get("version") != REFERENCE_VERSION:
-        print(f"FAIL: {args.reference} has version {reference.get('version')}, expected {REFERENCE_VERSION}")
+    try:
+        validate_reference(reference)
+    except ReferenceError as exc:
+        print(f"FAIL: {args.reference}: {exc}")
         return 2
     try:
         ok, summary = run(args.base_url, args.model, reference)
